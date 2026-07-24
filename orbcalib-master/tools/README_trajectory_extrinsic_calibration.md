@@ -9,6 +9,13 @@ Run it after `estimate_aruco_slam_scale.py` (see `README_scale_recovery.md`)
 and after re-exporting the raw keyframe CSVs with the pose-carrying
 `atlas_export_observations` build (adds `qw,qx,qy,qz` columns).
 
+When a raw CSV is inside a controlled-run folder with `manifest.txt` and
+`frame_pairs.csv`, the tool converts raw ROS playback timestamps back to the
+original source PNG timestamps before matching trajectories. This makes
+independently replayed/single-camera runs comparable on the dataset clock.
+Use `--raw-ros-timestamps` only for legacy/debug runs where the raw CSV
+timestamps should be used directly.
+
 ## What It Does
 
 One tool, three stages, run together (each reuses what the previous one
@@ -160,6 +167,13 @@ and all three final `T_<camera1>_<camera2>*` blocks.
 - **Marker coverage matters.** Pick (or let auto-selection pick) a marker
   actually seen by both cameras -- check the printed per-marker keyframe
   counts. A marker only one camera saw is useless for this.
+- **Visual marker fallback.** If a marker is visible in exported keyframe
+  images but ORB-SLAM did not reconstruct enough map points on the marker,
+  the alignment tool falls back to direct ArUco corner detections for that
+  camera's anchor keyframe. This lets the run continue, but if no external
+  `--camera*-scale` is supplied the camera uses unit SLAM scale and the
+  saved diagnostics mark `scale_ambiguous: True`. Rotations can still be
+  useful; translations involving that camera are not metric.
 - **Distance from the anchor keyframe, not timestamp gap, is the dominant
   accuracy driver.** Each camera's transform is exact at its own anchor
   keyframe and degrades slowly with distance from it (monocular SLAM has no
@@ -193,5 +207,5 @@ and all three final `T_<camera1>_<camera2>*` blocks.
   known-camera-height result) -- useful since the marker-point-pair method
   can be noisy for small markers viewed from a distance, while ground-plane
   fitting has a much larger effective baseline. The alignment JSON records
-  which source was used per camera (`scale_source`: `"external"` or
-  `"anchor_marker_points"`).
+  which source was used per camera (`scale_source`: `"external"`,
+  `"anchor_marker_points"`, or a unit-scale visual fallback source).

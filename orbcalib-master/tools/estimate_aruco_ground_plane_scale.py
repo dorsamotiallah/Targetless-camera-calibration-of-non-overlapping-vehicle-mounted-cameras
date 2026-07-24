@@ -78,6 +78,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ransac-iterations", type=int, default=3000, help="Number of RANSAC plane samples.")
     parser.add_argument("--outlier-mad", type=float, default=3.5, help="MAD cutoff for camera-distance scale summary.")
     parser.add_argument("--seed", type=int, default=0, help="RANSAC random seed.")
+    parser.add_argument(
+        "--broad-ground-fallback-below",
+        type=int,
+        default=20,
+        help="If broad fallback is explicitly enabled and unique ArUco map points are below this count, fit the "
+        "ground plane from broader lower-than-camera support points while requiring the ArUco points to be plane "
+        "inliers. Default: 20.",
+    )
+    parser.add_argument(
+        "--enable-broad-ground-fallback",
+        dest="disable_broad_ground_fallback",
+        action="store_false",
+        help="Opt in to broad lower-than-camera support fallback. Default is marker-only plane fitting.",
+    )
+    parser.add_argument(
+        "--disable-broad-ground-fallback",
+        dest="disable_broad_ground_fallback",
+        action="store_true",
+        help="Use only ArUco marker points for plane fitting. This is the default.",
+    )
+    parser.set_defaults(disable_broad_ground_fallback=True)
+    parser.add_argument(
+        "--fallback-min-support-points",
+        type=int,
+        default=50,
+        help="Minimum unique broad support points required before using the fallback. Default: 50.",
+    )
+    parser.add_argument(
+        "--fallback-marker-inlier-fraction",
+        type=float,
+        default=1.0,
+        help="Required fraction of unique ArUco marker points that must be inliers to the fallback plane. "
+        "Default: 1.0, meaning every ArUco point must lie on the accepted plane.",
+    )
+    parser.add_argument(
+        "--fallback-camera-y-min",
+        type=float,
+        default=0.0,
+        help="Lower-than-camera filter in camera coordinates: keep support points with y_cam >= this value. "
+        "OpenCV camera y points downward. Default: 0.0.",
+    )
+    parser.add_argument(
+        "--fallback-min-depth",
+        type=float,
+        default=1e-6,
+        help="Keep fallback support points only if they are in front of the camera by at least this depth. Default: 1e-6.",
+    )
     parser.add_argument("--out-dir", type=Path, help="Output directory. Defaults to <run-dir>/aruco_ground_scale.")
     return parser.parse_args()
 
@@ -111,6 +158,24 @@ def unique_by_map_point(points: Iterable[Dict[str, object]]) -> List[Dict[str, o
     return list(best_by_mp.values())
 
 
+def unique_support_by_map_point(points: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
+    by_mp: Dict[str, Dict[str, object]] = {}
+    for point in points:
+        mp_id = str(point["mp_id"])
+        previous = by_mp.get(mp_id)
+        if previous is None:
+            by_mp[mp_id] = point
+            continue
+        previous_is_marker = str(previous.get("support_source", "")) == "aruco_marker"
+        point_is_marker = str(point.get("support_source", "")) == "aruco_marker"
+        if point_is_marker and not previous_is_marker:
+            by_mp[mp_id] = point
+            continue
+        if float(point.get("camera_y_coord", 0.0)) > float(previous.get("camera_y_coord", 0.0)):
+            by_mp[mp_id] = point
+    return list(by_mp.values())
+
+
 def unique_camera_centers(points: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
     by_kf: Dict[str, List[np.ndarray]] = defaultdict(list)
     metadata: Dict[str, Dict[str, object]] = {}
@@ -140,6 +205,122 @@ def unique_camera_centers(points: Iterable[Dict[str, object]]) -> List[Dict[str,
         row.update({"camera_x": center[0], "camera_y": center[1], "camera_z": center[2]})
         centers.append(row)
     return sorted(centers, key=lambda row: int(float(str(row["kf_id"]))))
+
+
+def quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
+    qw, qx, qy, qz = q / np.linalg.norm(q)
+    return np.array(
+        [
+            [1 - 2 * (qy**2 + qz**2), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx**2 + qz**2), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx**2 + qy**2)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def raw_row_has_pose(row: Dict[str, str]) -> bool:
+    return {"camera_x", "camera_y", "camera_z", "qw", "qx", "qy", "qz"}.issubset(set(row))
+
+
+def support_point_from_raw_row(
+    row: Dict[str, str],
+    camera: str,
+    side: str,
+    source: str,
+    marker_id: object = "",
+    image_path: object = "",
+    signed_distance_to_marker_px: object = "",
+    marker_x_norm: object = "",
+    marker_y_norm: object = "",
+    marker_x_m: object = "",
+    marker_y_m: object = "",
+) -> Optional[Dict[str, object]]:
+    try:
+        mp = np.array([row_float(row, "mp_x"), row_float(row, "mp_y"), row_float(row, "mp_z")], dtype=np.float64)
+        center = np.array(
+            [row_float(row, "camera_x"), row_float(row, "camera_y"), row_float(row, "camera_z")],
+            dtype=np.float64,
+        )
+        q = np.array(
+            [row_float(row, "qw"), row_float(row, "qx"), row_float(row, "qy"), row_float(row, "qz")],
+            dtype=np.float64,
+        )
+    except (KeyError, ValueError):
+        return None
+    if not np.isfinite(mp).all() or not np.isfinite(center).all() or not np.isfinite(q).all():
+        return None
+    R_cw = quaternion_to_matrix(q)
+    p_cam = R_cw @ (mp - center)
+    return {
+        "camera": camera,
+        "side": side,
+        "support_source": source,
+        "marker_id": marker_id,
+        "kf_id": row["kf_id"],
+        "frame_id": row["frame_id"],
+        "timestamp": row.get("timestamp", ""),
+        "image_path": image_path,
+        "kp_idx": row["kp_idx"],
+        "mp_id": row["mp_id"],
+        "u": row_float(row, "u"),
+        "v": row_float(row, "v"),
+        "marker_x_norm": marker_x_norm,
+        "marker_y_norm": marker_y_norm,
+        "marker_x_m": marker_x_m,
+        "marker_y_m": marker_y_m,
+        "signed_distance_to_marker_px": signed_distance_to_marker_px,
+        "mp_x": float(mp[0]),
+        "mp_y": float(mp[1]),
+        "mp_z": float(mp[2]),
+        "camera_x": float(center[0]),
+        "camera_y": float(center[1]),
+        "camera_z": float(center[2]),
+        "camera_x_coord": float(p_cam[0]),
+        "camera_y_coord": float(p_cam[1]),
+        "camera_z_coord": float(p_cam[2]),
+    }
+
+
+def collect_lower_camera_support_points(
+    rows: List[Dict[str, str]],
+    marker_points: List[Dict[str, object]],
+    camera: str,
+    side: str,
+    camera_y_min: float,
+    min_depth: float,
+) -> List[Dict[str, object]]:
+    support: List[Dict[str, object]] = []
+    for point in marker_points:
+        raw_like = {key: str(point.get(key, "")) for key in point}
+        marker_support = support_point_from_raw_row(
+            raw_like,
+            camera,
+            side,
+            "aruco_marker",
+            marker_id=point.get("marker_id", ""),
+            image_path=point.get("image_path", ""),
+            signed_distance_to_marker_px=point.get("signed_distance_to_marker_px", ""),
+            marker_x_norm=point.get("marker_x_norm", ""),
+            marker_y_norm=point.get("marker_y_norm", ""),
+            marker_x_m=point.get("marker_x_m", ""),
+            marker_y_m=point.get("marker_y_m", ""),
+        )
+        if marker_support is not None:
+            support.append(marker_support)
+
+    for row in rows:
+        if not raw_row_has_pose(row):
+            continue
+        point = support_point_from_raw_row(row, camera, side, "lower_than_camera")
+        if point is None:
+            continue
+        if float(point["camera_z_coord"]) < min_depth:
+            continue
+        if float(point["camera_y_coord"]) < camera_y_min:
+            continue
+        support.append(point)
+    return support
 
 
 def plane_from_points(points: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
@@ -222,13 +403,106 @@ def fit_ransac_plane(
     }
 
 
+def fit_ransac_plane_with_marker_constraint(
+    support_points: np.ndarray,
+    marker_points: np.ndarray,
+    camera_centers: np.ndarray,
+    threshold: float,
+    iterations: int,
+    seed: int,
+    marker_inlier_fraction: float,
+) -> Dict[str, object]:
+    if support_points.shape[0] < 3:
+        raise ValueError("At least 3 support points are required to fit a plane")
+    if marker_points.shape[0] < 3:
+        raise ValueError("At least 3 ArUco marker points are required to constrain the fallback plane")
+    if threshold <= 0.0:
+        raise ValueError("--ransac-threshold must be positive")
+    if not 0.0 < marker_inlier_fraction <= 1.0:
+        raise ValueError("--fallback-marker-inlier-fraction must be in (0, 1]")
+
+    rng = np.random.default_rng(seed)
+    required_marker_inliers = int(math.ceil(marker_inlier_fraction * marker_points.shape[0]))
+    best: Optional[Dict[str, object]] = None
+
+    for _ in range(iterations):
+        sample_idx = rng.choice(support_points.shape[0], size=3, replace=False)
+        candidate = plane_from_points(support_points[sample_idx])
+        if candidate is None:
+            continue
+        normal, offset = candidate
+        support_distances = np.abs(support_points.dot(normal) + offset)
+        marker_distances = np.abs(marker_points.dot(normal) + offset)
+        marker_inliers = marker_distances <= threshold
+        marker_count = int(np.count_nonzero(marker_inliers))
+        if marker_count < required_marker_inliers:
+            continue
+        support_inliers = support_distances <= threshold
+        support_count = int(np.count_nonzero(support_inliers))
+        if support_count < 3:
+            continue
+        score = (
+            support_count,
+            marker_count,
+            -float(np.median(marker_distances)),
+            -float(np.median(support_distances[support_inliers])),
+        )
+        if best is None or score > best["score"]:
+            best = {
+                "normal": normal,
+                "offset": offset,
+                "score": score,
+                "support_inliers": support_inliers,
+                "marker_distances": marker_distances,
+            }
+
+    if best is None:
+        raise RuntimeError(
+            "RANSAC failed to find a broad support plane that keeps the required ArUco marker points as inliers"
+        )
+
+    normal = np.asarray(best["normal"], dtype=np.float64)
+    offset = float(best["offset"])
+    support_distances = np.abs(support_points.dot(normal) + offset)
+    support_inliers = support_distances <= threshold
+    if int(np.count_nonzero(support_inliers)) >= 3:
+        inlier_points = support_points[support_inliers]
+        centroid = np.mean(inlier_points, axis=0)
+        _, _, vh = np.linalg.svd(inlier_points - centroid, full_matrices=False)
+        refined_normal = vh[-1]
+        refined_normal /= np.linalg.norm(refined_normal)
+        refined_offset = -float(refined_normal.dot(centroid))
+        refined_normal, refined_offset = canonical_plane(refined_normal, refined_offset, camera_centers)
+        refined_marker_distances = np.abs(marker_points.dot(refined_normal) + refined_offset)
+        if int(np.count_nonzero(refined_marker_distances <= threshold)) >= required_marker_inliers:
+            normal, offset = refined_normal, refined_offset
+
+    normal, offset = canonical_plane(normal, offset, camera_centers)
+    support_distances = np.abs(support_points.dot(normal) + offset)
+    marker_distances = np.abs(marker_points.dot(normal) + offset)
+    support_inliers = support_distances <= threshold
+    marker_inliers = marker_distances <= threshold
+    if int(np.count_nonzero(marker_inliers)) < required_marker_inliers:
+        raise RuntimeError("Refined broad support plane no longer satisfies the ArUco inlier constraint")
+
+    return {
+        "normal": normal,
+        "offset": offset,
+        "point_distances": support_distances,
+        "inliers": support_inliers,
+        "marker_distances": marker_distances,
+        "marker_inliers": marker_inliers,
+        "required_marker_inliers": required_marker_inliers,
+    }
+
+
 def collect_camera_points(
     run_dir: Path,
     repo_root: Path,
     manifest: Dict[str, str],
     camera: str,
     args: argparse.Namespace,
-) -> Tuple[List[Dict[str, object]], int, int]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], int, int]:
     side = side_for_camera(camera, manifest)
     observations_csv = default_observations_csv(run_dir, camera, side, manifest, repo_root).resolve()
     grouped = read_raw_observations(observations_csv)
@@ -241,6 +515,7 @@ def collect_camera_points(
     marker_filter: Optional[set[int]] = set(args.marker_id) if args.marker_id else None
 
     point_rows: List[Dict[str, object]] = []
+    support_rows: List[Dict[str, object]] = []
     checked_keyframes = 0
     hit_keyframes = 0
     for kf_id, raw_rows in sorted(grouped.items(), key=lambda item: int(float(item[0]))):
@@ -263,6 +538,7 @@ def collect_camera_points(
             continue
 
         keyframe_hit = False
+        keyframe_marker_points: List[Dict[str, object]] = []
         detected_ids = [int(marker_id) for marker_id in ids.reshape(-1)]
         for marker_corners, marker_id in zip(corners_list, detected_ids):
             if marker_filter is not None and marker_id not in marker_filter:
@@ -300,17 +576,33 @@ def collect_camera_points(
                     "camera_x": row_float(row, "camera_x"),
                     "camera_y": row_float(row, "camera_y"),
                     "camera_z": row_float(row, "camera_z"),
+                    "qw": row.get("qw", ""),
+                    "qx": row.get("qx", ""),
+                    "qy": row.get("qy", ""),
+                    "qz": row.get("qz", ""),
                 }
                 if args.marker_length_m is not None:
                     marker_x_m, marker_y_m = marker_metric_coordinates(marker_corners, (u, v), args.marker_length_m)
                     point["marker_x_m"] = marker_x_m
                     point["marker_y_m"] = marker_y_m
                 point_rows.append(point)
+                keyframe_marker_points.append(point)
                 keyframe_hit = True
         if keyframe_hit:
             hit_keyframes += 1
+            if not args.disable_broad_ground_fallback:
+                support_rows.extend(
+                    collect_lower_camera_support_points(
+                        rows,
+                        keyframe_marker_points,
+                        camera,
+                        side,
+                        args.fallback_camera_y_min,
+                        args.fallback_min_depth,
+                    )
+                )
 
-    return point_rows, checked_keyframes, hit_keyframes
+    return point_rows, support_rows, checked_keyframes, hit_keyframes
 
 
 def write_csv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]) -> None:
@@ -329,12 +621,23 @@ def summarize_camera(
     camera_height_m: Optional[float],
     args: argparse.Namespace,
     out_dir: Path,
+    support_points: Optional[List[Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     unique_points = unique_by_map_point(points)
+    broad_fallback_below = int(getattr(args, "broad_ground_fallback_below", 20))
+    disable_broad_fallback = bool(getattr(args, "disable_broad_ground_fallback", True))
+    fallback_min_support_points = int(getattr(args, "fallback_min_support_points", 50))
+    fallback_marker_inlier_fraction = float(getattr(args, "fallback_marker_inlier_fraction", 1.0))
+    use_broad_fallback = (
+        not disable_broad_fallback
+        and support_points is not None
+        and len(unique_points) < broad_fallback_below
+    )
     if len(unique_points) < args.min_points:
-        raise RuntimeError(f"{camera}: only {len(unique_points)} unique ArUco map points, need {args.min_points}")
+        if not use_broad_fallback:
+            raise RuntimeError(f"{camera}: only {len(unique_points)} unique ArUco map points, need {args.min_points}")
 
-    point_xyz = np.array(
+    marker_xyz = np.array(
         [[float(row["mp_x"]), float(row["mp_y"]), float(row["mp_z"])] for row in unique_points],
         dtype=float,
     )
@@ -343,13 +646,59 @@ def summarize_camera(
         [[float(row["camera_x"]), float(row["camera_y"]), float(row["camera_z"])] for row in camera_centers],
         dtype=float,
     )
-    fit = fit_ransac_plane(point_xyz, center_xyz, args.ransac_threshold, args.ransac_iterations, args.seed)
+
+    support_unique: List[Dict[str, object]] = []
+    support_xyz = marker_xyz
+    fit_mode = "aruco_marker_points"
+    marker_distances = np.array([], dtype=float)
+    marker_inliers = np.array([], dtype=bool)
+    fallback_reason: Optional[str] = None
+    if use_broad_fallback:
+        support_unique = unique_support_by_map_point(support_points or [])
+        if len(support_unique) < fallback_min_support_points:
+            raise RuntimeError(
+                f"{camera}: broad ground fallback requested because only {len(unique_points)} unique ArUco "
+                f"map point(s) were available, but only {len(support_unique)} unique lower-than-camera "
+                f"support point(s) were found; need {fallback_min_support_points}"
+            )
+        support_xyz = np.array(
+            [[float(row["mp_x"]), float(row["mp_y"]), float(row["mp_z"])] for row in support_unique],
+            dtype=float,
+        )
+        fit = fit_ransac_plane_with_marker_constraint(
+            support_xyz,
+            marker_xyz,
+            center_xyz,
+            args.ransac_threshold,
+            args.ransac_iterations,
+            args.seed,
+            fallback_marker_inlier_fraction,
+        )
+        fit_mode = "broad_lower_than_camera_support_with_aruco_constraint"
+        fallback_reason = (
+            f"unique ArUco marker points ({len(unique_points)}) below threshold "
+            f"({broad_fallback_below})"
+        )
+        marker_distances = np.asarray(fit["marker_distances"], dtype=float)
+        marker_inliers = np.asarray(fit["marker_inliers"], dtype=bool)
+    else:
+        fit = fit_ransac_plane(marker_xyz, center_xyz, args.ransac_threshold, args.ransac_iterations, args.seed)
     normal = np.asarray(fit["normal"], dtype=float)
     offset = float(fit["offset"])
     inliers = np.asarray(fit["inliers"], dtype=bool)
     point_distances = np.asarray(fit["point_distances"], dtype=float)
 
-    for row, distance, is_inlier in zip(unique_points, point_distances, inliers):
+    marker_point_distances = (
+        marker_distances if marker_distances.size else np.abs(marker_xyz.dot(normal) + offset)
+    )
+    marker_point_inliers = (
+        marker_inliers if marker_inliers.size else marker_point_distances <= args.ransac_threshold
+    )
+    for row, distance, is_inlier in zip(unique_points, marker_point_distances, marker_point_inliers):
+        row["plane_distance_slam"] = float(distance)
+        row["plane_inlier"] = int(bool(is_inlier))
+
+    for row, distance, is_inlier in zip(support_unique, point_distances, inliers):
         row["plane_distance_slam"] = float(distance)
         row["plane_inlier"] = int(bool(is_inlier))
 
@@ -395,6 +744,40 @@ def summarize_camera(
         "camera_x",
         "camera_y",
         "camera_z",
+        "qw",
+        "qx",
+        "qy",
+        "qz",
+        "plane_distance_slam",
+        "plane_inlier",
+    ]
+    support_fields = [
+        "camera",
+        "side",
+        "support_source",
+        "marker_id",
+        "kf_id",
+        "frame_id",
+        "timestamp",
+        "image_path",
+        "kp_idx",
+        "mp_id",
+        "u",
+        "v",
+        "marker_x_norm",
+        "marker_y_norm",
+        "marker_x_m",
+        "marker_y_m",
+        "signed_distance_to_marker_px",
+        "mp_x",
+        "mp_y",
+        "mp_z",
+        "camera_x",
+        "camera_y",
+        "camera_z",
+        "camera_x_coord",
+        "camera_y_coord",
+        "camera_z_coord",
         "plane_distance_slam",
         "plane_inlier",
     ]
@@ -412,25 +795,48 @@ def summarize_camera(
         "scale_m_per_slam_unit",
     ]
     write_csv(out_dir / f"{camera}_aruco_ground_points.csv", unique_points, point_fields)
+    support_csv = None
+    if support_unique:
+        support_csv = out_dir / f"{camera}_broad_ground_support_points.csv"
+        write_csv(support_csv, support_unique, support_fields)
     write_csv(out_dir / f"{camera}_camera_plane_distances.csv", camera_distance_rows, center_fields)
 
-    point_inlier_distances = point_distances[inliers]
+    marker_inlier_distances = marker_point_distances[marker_point_inliers]
+    support_inlier_distances = point_distances[inliers]
     scale_stats = robust_summary(np.asarray(scale_values, dtype=float), args.outlier_mad)
     return {
         "camera": camera,
+        "plane_fit_mode": fit_mode,
+        "fallback_reason": fallback_reason,
         "checked_keyframes": checked_keyframes,
         "marker_keyframes": hit_keyframes,
         "marker_point_observations": len(points),
         "unique_marker_points": len(unique_points),
-        "plane_inlier_points": int(np.count_nonzero(inliers)),
-        "plane_inlier_fraction": float(np.count_nonzero(inliers) / len(inliers)),
+        "marker_plane_inlier_points": int(np.count_nonzero(marker_point_inliers)),
+        "marker_plane_inlier_fraction": float(np.count_nonzero(marker_point_inliers) / len(marker_point_inliers)),
+        "support_point_observations": len(support_points or []),
+        "unique_support_points": len(support_unique) if support_unique else len(unique_points),
+        "support_plane_inlier_points": int(np.count_nonzero(inliers)),
+        "support_plane_inlier_fraction": float(np.count_nonzero(inliers) / len(inliers)),
+        "plane_inlier_points": int(np.count_nonzero(marker_point_inliers)),
+        "plane_inlier_fraction": float(np.count_nonzero(marker_point_inliers) / len(marker_point_inliers)),
         "plane_normal": normal.tolist(),
         "plane_offset": offset,
         "ransac_threshold_slam": args.ransac_threshold,
-        "plane_point_distance_slam": {
+        "marker_plane_point_distance_slam": {
+            "median_all": float(np.median(marker_point_distances)),
+            "median_inliers": float(np.median(marker_inlier_distances)) if marker_inlier_distances.size else None,
+            "mean_inliers": float(np.mean(marker_inlier_distances)) if marker_inlier_distances.size else None,
+        },
+        "support_plane_point_distance_slam": {
             "median_all": float(np.median(point_distances)),
-            "median_inliers": float(np.median(point_inlier_distances)) if point_inlier_distances.size else None,
-            "mean_inliers": float(np.mean(point_inlier_distances)) if point_inlier_distances.size else None,
+            "median_inliers": float(np.median(support_inlier_distances)) if support_inlier_distances.size else None,
+            "mean_inliers": float(np.mean(support_inlier_distances)) if support_inlier_distances.size else None,
+        },
+        "plane_point_distance_slam": {
+            "median_all": float(np.median(marker_point_distances)),
+            "median_inliers": float(np.median(marker_inlier_distances)) if marker_inlier_distances.size else None,
+            "mean_inliers": float(np.mean(marker_inlier_distances)) if marker_inlier_distances.size else None,
         },
         "camera_centers_used": len(camera_distance_rows),
         "camera_height_m": camera_height_m,
@@ -443,6 +849,7 @@ def summarize_camera(
         "recommended_scale_m_per_slam_unit": scale_stats["kept_median"],
         "outputs": {
             "points_csv": str(out_dir / f"{camera}_aruco_ground_points.csv"),
+            "support_points_csv": str(support_csv) if support_csv else None,
             "camera_distances_csv": str(out_dir / f"{camera}_camera_plane_distances.csv"),
         },
     }
@@ -465,9 +872,20 @@ def main() -> int:
 
     summaries: List[Dict[str, object]] = []
     for camera in cameras:
-        camera_points, checked_keyframes, hit_keyframes = collect_camera_points(run_dir, repo_root, manifest, camera, args)
+        camera_points, support_points, checked_keyframes, hit_keyframes = collect_camera_points(
+            run_dir, repo_root, manifest, camera, args
+        )
         height = camera_height_for(camera, args.camera_height_m, heights)
-        summary = summarize_camera(camera, camera_points, checked_keyframes, hit_keyframes, height, args, out_dir)
+        summary = summarize_camera(
+            camera,
+            camera_points,
+            checked_keyframes,
+            hit_keyframes,
+            height,
+            args,
+            out_dir,
+            support_points=support_points,
+        )
         summaries.append(summary)
 
     summary = {
@@ -486,8 +904,10 @@ def main() -> int:
     print(f"Wrote ground-plane scale outputs: {out_dir}")
     for item in summaries:
         print(
-            f"{item['camera']}: {item['unique_marker_points']} points, "
-            f"{item['plane_inlier_points']} inliers, recommended scale "
+            f"{item['camera']}: {item['plane_fit_mode']}, "
+            f"{item['unique_marker_points']} marker points, "
+            f"{item['marker_plane_inlier_points']} marker inliers, "
+            f"{item['unique_support_points']} support points, recommended scale "
             f"{item['recommended_scale_m_per_slam_unit']}"
         )
     return 0

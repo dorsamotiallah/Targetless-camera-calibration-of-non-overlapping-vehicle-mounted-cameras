@@ -16,10 +16,10 @@ import cv2
 import numpy as np
 
 from estimate_aruco_pattern_distance import detect_markers, dictionary_name
+from estimate_checkerboard_camera_height import CameraCalibration, read_calibration, scaled_calibration
 from find_aruco_map_points import (
     draw_debug,
     load_side_image,
-    marker_normalized_coordinates,
     side_for_camera,
     unique_observations,
 )
@@ -54,6 +54,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--observations-csv", type=Path, help="Raw atlas observations CSV. Defaults from run manifest/name.")
     parser.add_argument("--camera1-dir", type=Path, help="Override camera 1 PNG directory")
     parser.add_argument("--camera2-dir", type=Path, help="Override camera 2 PNG directory")
+    parser.add_argument(
+        "--camera-config",
+        type=Path,
+        help=(
+            "Optional ORB-SLAM camera YAML. When supplied, marker corners and keypoints are "
+            "undistorted before marker geometry tests. Use this for raw fisheye frames."
+        ),
+    )
     parser.add_argument("--marker-length-m", type=float, required=True, help="Physical ArUco marker side length in meters.")
     parser.add_argument("--dictionary-size", type=int, default=50, help="OpenCV 6x6 dictionary size. Default: 50")
     parser.add_argument("--marker-id", type=int, action="append", help="Marker id to keep. Can be repeated.")
@@ -124,14 +132,37 @@ def read_raw_observations(path: Path) -> Dict[str, List[Dict[str, str]]]:
     return grouped
 
 
-def marker_metric_coordinates(
+def undistorted_geometry_points(points_uv: np.ndarray, calib: Optional[CameraCalibration]) -> np.ndarray:
+    points = np.ascontiguousarray(points_uv, dtype=np.float64).reshape(-1, 1, 2)
+    if calib is None:
+        return points.reshape(-1, 2).astype(np.float32)
+
+    if calib.model == "KannalaBrandt8":
+        undistorted = cv2.fisheye.undistortPoints(points, calib.K, calib.D)
+    elif calib.model == "PinHole":
+        undistorted = cv2.undistortPoints(points, calib.K, calib.D)
+    else:
+        raise ValueError(f"Unsupported camera model: {calib.model}")
+    return undistorted.reshape(-1, 2).astype(np.float32)
+
+
+def marker_coordinates_from_geometry(
     corners: np.ndarray,
     point: Tuple[float, float],
     marker_length_m: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float]:
     half = marker_length_m * 0.5
     src = corners.reshape(4, 2).astype(np.float32)
-    dst = np.array(
+    dst_norm = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    dst_metric = np.array(
         [
             [-half, half],
             [half, half],
@@ -140,9 +171,26 @@ def marker_metric_coordinates(
         ],
         dtype=np.float32,
     )
-    homography = cv2.getPerspectiveTransform(src, dst)
-    projected = cv2.perspectiveTransform(np.array([[point]], dtype=np.float32), homography)
-    return float(projected[0, 0, 0]), float(projected[0, 0, 1])
+    point_array = np.array([[point]], dtype=np.float32)
+    norm_h = cv2.getPerspectiveTransform(src, dst_norm)
+    metric_h = cv2.getPerspectiveTransform(src, dst_metric)
+    norm = cv2.perspectiveTransform(point_array, norm_h)
+    metric = cv2.perspectiveTransform(point_array, metric_h)
+    return (
+        float(norm[0, 0, 0]),
+        float(norm[0, 0, 1]),
+        float(metric[0, 0, 0]),
+        float(metric[0, 0, 1]),
+    )
+
+
+def marker_metric_coordinates(
+    corners: np.ndarray,
+    point: Tuple[float, float],
+    marker_length_m: float,
+) -> Tuple[float, float]:
+    _, _, marker_x_m, marker_y_m = marker_coordinates_from_geometry(corners, point, marker_length_m)
+    return marker_x_m, marker_y_m
 
 
 def unique_by_map_point(points: Iterable[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -224,6 +272,7 @@ def main() -> int:
     side = side_for_camera(args.camera, manifest)
     observations_csv = args.observations_csv or default_observations_csv(run_dir, args.camera, side, manifest, repo_root)
     observations_csv = observations_csv.resolve()
+    base_calib = read_calibration(args.camera_config.resolve()) if args.camera_config else None
 
     out_dir = args.out_dir or run_dir / "aruco_scale" / args.camera
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -262,6 +311,12 @@ def main() -> int:
             args.frame_id_offset,
             not args.no_frame_id_wrap,
         )
+        image_calib = scaled_calibration(base_calib, (image.shape[1], image.shape[0])) if base_calib else None
+        margin_geometry = args.margin_px
+        if image_calib is not None:
+            avg_focal = 0.5 * (float(image_calib.K[0, 0]) + float(image_calib.K[1, 1]))
+            margin_geometry = args.margin_px / avg_focal if avg_focal > 0.0 else 0.0
+
         corners_list, ids, _ = detect_markers(image, args.dictionary_size)
         if ids is None or len(ids) == 0:
             continue
@@ -272,17 +327,26 @@ def main() -> int:
             if marker_filter is not None and marker_id not in marker_filter:
                 continue
 
-            polygon = marker_corners.reshape(4, 2).astype(np.float32)
+            raw_corners = marker_corners.reshape(4, 2).astype(np.float32)
+            geometry_corners = undistorted_geometry_points(raw_corners, image_calib)
             selected: List[Dict[str, object]] = []
             for row in rows:
                 u = row_float(row, "u")
                 v = row_float(row, "v")
-                signed_distance = cv2.pointPolygonTest(polygon, (float(u), float(v)), True)
-                if signed_distance < -args.margin_px:
+                geometry_point = undistorted_geometry_points(np.array([[u, v]], dtype=np.float64), image_calib)[0]
+                signed_distance = cv2.pointPolygonTest(
+                    geometry_corners,
+                    (float(geometry_point[0]), float(geometry_point[1])),
+                    True,
+                )
+                if signed_distance < -margin_geometry:
                     continue
 
-                marker_x_norm, marker_y_norm = marker_normalized_coordinates(marker_corners, (u, v))
-                marker_x_m, marker_y_m = marker_metric_coordinates(marker_corners, (u, v), args.marker_length_m)
+                marker_x_norm, marker_y_norm, marker_x_m, marker_y_m = marker_coordinates_from_geometry(
+                    geometry_corners,
+                    (float(geometry_point[0]), float(geometry_point[1])),
+                    args.marker_length_m,
+                )
                 point = {
                     "camera": args.camera,
                     "marker_id": marker_id,
@@ -354,7 +418,7 @@ def main() -> int:
             if marker_pair_count > 0:
                 marker_observations_with_pairs += 1
                 point_rows.extend(selected)
-                marker_infos.append({"marker_id": marker_id, "corners": marker_corners, "points": selected})
+                marker_infos.append({"marker_id": marker_id, "corners": raw_corners, "points": selected})
 
         if args.debug_images and marker_infos:
             out_name = f"{args.camera}_kf{kf_id}_{Path(image_path).stem}_scale_points.png"
@@ -421,6 +485,9 @@ def main() -> int:
         "camera": args.camera,
         "side": side,
         "observations_csv": str(observations_csv),
+        "camera_config": str(args.camera_config.resolve()) if args.camera_config else None,
+        "camera_model": base_calib.model if base_calib is not None else "raw_pixel",
+        "geometry_domain": "undistorted_normalized" if base_calib is not None else "raw_pixel",
         "aruco_dictionary": dictionary_name(args.dictionary_size),
         "marker_length_m": args.marker_length_m,
         "marker_ids": sorted(marker_filter) if marker_filter is not None else "all",
