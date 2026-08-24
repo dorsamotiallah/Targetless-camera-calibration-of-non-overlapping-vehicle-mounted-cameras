@@ -20,7 +20,7 @@ CAMERA2_CONFIG=${CAMERA2_CONFIG:-}
 MARKER_ID=${MARKER_ID:-0}
 MARKER_LENGTH_M=${MARKER_LENGTH_M:-0.182}
 DICTIONARY_SIZE=${DICTIONARY_SIZE:-50}
-KEYFRAME_CANDIDATES=${KEYFRAME_CANDIDATES:-5}
+DICTIONARY_BITS=${DICTIONARY_BITS:-6}
 MAX_DISTANCE_FROM_ANCHOR_M=${MAX_DISTANCE_FROM_ANCHOR_M:-}
 CAMERA1_MAX_DISTANCE_FROM_ANCHOR_M=${CAMERA1_MAX_DISTANCE_FROM_ANCHOR_M:-}
 CAMERA2_MAX_DISTANCE_FROM_ANCHOR_M=${CAMERA2_MAX_DISTANCE_FROM_ANCHOR_M:-}
@@ -39,8 +39,11 @@ Usage: $(basename "$0") (--run-id NAME | --run-dir PATH) --camera1 NAME --camera
 Runs, in order:
   1. estimate_aruco_slam_scale.py for camera1
   2. estimate_aruco_slam_scale.py for camera2
-  3. align_trajectories_to_aruco.py using the generated point CSVs and any
-     finite recommended_scale_m_per_slam_unit values from the scale summaries.
+  3. align_trajectories_to_aruco.py --alignment-source optimized-anchor, using
+     the generated point CSVs and the recommended_scale_m_per_slam_unit value
+     from each camera's scale summary (a many-keyframe, MAD-trimmed robust
+     rotation fit with that externally supplied scale -- both cameras need a
+     finite recovered scale, or the run fails).
 
 Options:
   --run-id NAME                 Run folder name under --results-root.
@@ -58,8 +61,8 @@ Options:
   --camera2-config PATH         Default: config/sim/agilex_<camera2>_defished_cam.yaml
   --marker-id ID                Marker ID to use. Default: $MARKER_ID
   --marker-length-m M           ArUco marker side length in meters. Default: $MARKER_LENGTH_M
-  --dictionary-size N           OpenCV 6x6 dictionary size. Default: $DICTIONARY_SIZE
-  --keyframe-candidates N       Alignment keyframe candidates. Default: $KEYFRAME_CANDIDATES
+  --dictionary-size N           OpenCV dictionary size. Default: $DICTIONARY_SIZE
+  --dictionary-bits N           ArUco marker grid size. Default: $DICTIONARY_BITS
   --max-distance-from-anchor-m M
   --camera1-max-distance-from-anchor-m M
   --camera2-max-distance-from-anchor-m M
@@ -91,7 +94,7 @@ while [[ $# -gt 0 ]]; do
     --marker-id) MARKER_ID="$2"; shift 2 ;;
     --marker-length-m) MARKER_LENGTH_M="$2"; shift 2 ;;
     --dictionary-size) DICTIONARY_SIZE="$2"; shift 2 ;;
-    --keyframe-candidates) KEYFRAME_CANDIDATES="$2"; shift 2 ;;
+    --dictionary-bits) DICTIONARY_BITS="$2"; shift 2 ;;
     --max-distance-from-anchor-m) MAX_DISTANCE_FROM_ANCHOR_M="$2"; shift 2 ;;
     --camera1-max-distance-from-anchor-m) CAMERA1_MAX_DISTANCE_FROM_ANCHOR_M="$2"; shift 2 ;;
     --camera2-max-distance-from-anchor-m) CAMERA2_MAX_DISTANCE_FROM_ANCHOR_M="$2"; shift 2 ;;
@@ -194,6 +197,7 @@ scale_camera() {
     --camera "$camera"
     --marker-length-m "$MARKER_LENGTH_M"
     --dictionary-size "$DICTIONARY_SIZE"
+    --dictionary-bits "$DICTIONARY_BITS"
     --marker-id "$MARKER_ID"
     --out-dir "$out_dir"
   )
@@ -233,37 +237,38 @@ require_file "$CAMERA2_SUMMARY"
 CAMERA1_SCALE=$(json_optional_number "$CAMERA1_SUMMARY" recommended_scale_m_per_slam_unit)
 CAMERA2_SCALE=$(json_optional_number "$CAMERA2_SUMMARY" recommended_scale_m_per_slam_unit)
 
+if [[ -z "$CAMERA1_SCALE" ]]; then
+  echo "$CAMERA1_NAME: no recommended_scale_m_per_slam_unit in $CAMERA1_SUMMARY -- cannot run optimized-anchor alignment without an externally supplied scale." >&2
+  exit 1
+fi
+if [[ -z "$CAMERA2_SCALE" ]]; then
+  echo "$CAMERA2_NAME: no recommended_scale_m_per_slam_unit in $CAMERA2_SUMMARY -- cannot run optimized-anchor alignment without an externally supplied scale." >&2
+  exit 1
+fi
+echo "Using $CAMERA1_NAME scale: $CAMERA1_SCALE m/slam-unit"
+echo "Using $CAMERA2_NAME scale: $CAMERA2_SCALE m/slam-unit"
+
 align_args=(
   python3 tools/align_trajectories_to_aruco.py
+  --alignment-source optimized-anchor
   --camera1-name "$CAMERA1_NAME"
   --camera1-points-csv "$CAMERA1_POINTS"
   --camera1-raw-csv "$CAMERA1_RUN_DIR/${CAMERA1_NAME}_raw_keyframe_observations.csv"
   --camera1-config "$CAMERA1_CONFIG"
+  --camera1-scale "$CAMERA1_SCALE"
   --camera2-name "$CAMERA2_NAME"
   --camera2-points-csv "$CAMERA2_POINTS"
   --camera2-raw-csv "$CAMERA2_RUN_DIR/${CAMERA2_NAME}_raw_keyframe_observations.csv"
   --camera2-config "$CAMERA2_CONFIG"
+  --camera2-scale "$CAMERA2_SCALE"
   --marker-id "$MARKER_ID"
   --marker-length-m "$MARKER_LENGTH_M"
   --dictionary-size "$DICTIONARY_SIZE"
-  --keyframe-candidates "$KEYFRAME_CANDIDATES"
+  --dictionary-bits "$DICTIONARY_BITS"
   --output-plot "$OUTPUT_DIR/aruco_alignment/${CAMERA1_NAME}_${CAMERA2_NAME}_trajectories.png"
   --output-alignment-json "$OUTPUT_DIR/aruco_alignment/${CAMERA1_NAME}_${CAMERA2_NAME}_alignment.json"
   --output-extrinsic-yaml "$OUTPUT_DIR/aruco_alignment/${CAMERA1_NAME}_${CAMERA2_NAME}_extrinsic.yaml"
 )
-
-if [[ -n "$CAMERA1_SCALE" ]]; then
-  echo "Using $CAMERA1_NAME scale: $CAMERA1_SCALE m/slam-unit"
-  align_args+=(--camera1-scale "$CAMERA1_SCALE")
-else
-  echo "$CAMERA1_NAME scale unavailable from SLAM marker points; alignment may use visual ArUco fallback with unit scale."
-fi
-if [[ -n "$CAMERA2_SCALE" ]]; then
-  echo "Using $CAMERA2_NAME scale: $CAMERA2_SCALE m/slam-unit"
-  align_args+=(--camera2-scale "$CAMERA2_SCALE")
-else
-  echo "$CAMERA2_NAME scale unavailable from SLAM marker points; alignment may use visual ArUco fallback with unit scale."
-fi
 
 if [[ -n "$MAX_DISTANCE_FROM_ANCHOR_M" ]]; then
   align_args+=(--max-distance-from-anchor-m "$MAX_DISTANCE_FROM_ANCHOR_M")

@@ -2,9 +2,19 @@
 /*
 
 # Keep only the project folders we want to version.
+# NMC3D/ is no longer a separate tracked project: its unique content now
+# lives under orbcalib-master/nmc3d/, so it's a plain local working
+# directory here, same as papers/ or gazebo/ -- present on disk, not
+# tracked.
 !/.gitignore
+!/README.md
 !/orbcalib-master/
-!/NMC3D/
+
+# Local datasets and calibration ground-truth files stay outside Git.
+Agilex Recordings/
+Finnforest/
+gazebo/
+papers/
 
 # Ignore heavy/generated outputs inside the kept folders.
 orbcalib-master/build/
@@ -12,9 +22,17 @@ orbcalib-master/build_*/
 orbcalib-master/devel/
 orbcalib-master/install/
 orbcalib-master/results_*/
+orbcalib-master/*results*/
+orbcalib-master/*reruns*/
 orbcalib-master/good_results_2/
+orbcalib-master/nmc3d/results/
 orbcalib-master/calib_inliers_*.csv
-orbcalib-master/sahkotalo_fov120_fov130_calibration_report.pdf
+orbcalib-master/**/*.csv
+orbcalib-master/**/*.pdf
+orbcalib-master/**/manifest.txt
+orbcalib-master/**/SUMMARY.md
+orbcalib-master/**/output_*.txt
+orbcalib-master/**/*report*.pdf
 orbcalib-master/**/*.log
 orbcalib-master/**/*.osa
 orbcalib-master/**/*atlasCamera*.osa
@@ -23,17 +41,3 @@ orbcalib-master/**/*.mcap
 orbcalib-master/**/__pycache__/
 orbcalib-master/**/*.pyc
 orbcalib-master/**/.DS_Store
-
-NMC3D/build/
-NMC3D/build_*/
-NMC3D/devel/
-NMC3D/install/
-NMC3D/results_*/
-NMC3D/**/*.log
-NMC3D/**/*.osa
-NMC3D/**/*atlasCamera*.osa
-NMC3D/**/*.bag
-NMC3D/**/*.mcap
-NMC3D/**/__pycache__/
-NMC3D/**/*.pyc
-NMC3D/**/.DS_Store

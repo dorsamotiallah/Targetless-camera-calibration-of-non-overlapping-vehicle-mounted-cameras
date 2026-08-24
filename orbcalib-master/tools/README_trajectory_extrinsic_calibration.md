@@ -1,9 +1,13 @@
 # Trajectory-Based Extrinsic Calibration via ArUco
 
-`align_trajectories_to_aruco.py` calibrates two cameras that ran
-**independent monocular SLAM sessions with no shared visual overlap** (e.g.
-front vs. left, front vs. back), using a shared ArUco marker as the common
-reference frame instead of feature matching between the two maps.
+`align_trajectories_to_aruco.py` calibrates two cameras whose **independent
+monocular SLAM sessions never share any physical scene content** to match
+features between (e.g. front vs. left, front vs. back, when neither camera's
+path ever revisits anywhere the other one mapped) -- using a shared ArUco
+marker as the common reference frame instead of feature matching between the
+two maps. If your maps do share some scene content, `/calib`'s CamMap-based
+map alignment (`../README.md`) needs no marker at all and is the simpler
+default; use this tool when that isn't an option.
 
 Run it after `estimate_aruco_slam_scale.py` (see `README_scale_recovery.md`)
 and after re-exporting the raw keyframe CSVs with the pose-carrying
@@ -16,28 +20,51 @@ independently replayed/single-camera runs comparable on the dataset clock.
 Use `--raw-ros-timestamps` only for legacy/debug runs where the raw CSV
 timestamps should be used directly.
 
+## `--alignment-source` (required)
+
+Stage 1 (below) can register each camera's SLAM map to the marker frame in
+one of three ways. There is no default -- pick one explicitly:
+
+- **`optimized-anchor`** (recommended whenever you already have a per-camera
+  scale from elsewhere, e.g. `estimate_aruco_slam_scale.py`'s point-pair
+  scale or `estimate_aruco_ground_plane_scale.py`'s ground-plane scale).
+  Detects the marker in every exported keyframe it can, solves metric PnP
+  for each detection, and fits rotation as a MAD-trimmed, iteratively
+  re-weighted chordal mean across *all* of them -- while holding scale fixed
+  at the externally supplied `--camera1-scale`/`--camera2-scale`. Requires
+  both scales; there is no per-camera fallback.
+- **`visual-aruco-sim3`** -- same many-keyframe marker detection and
+  rotation fit as `optimized-anchor`, but also fits its own scale jointly
+  (least-squares over camera-center spread in SLAM units vs. marker-frame
+  units). Use this when you don't have an external scale for one or both
+  cameras. Its scale fit is sensitive to monocular SLAM scale drift over
+  long, spatially separated marker sightings (see `README_scale_recovery.md`
+  discussion of point-pair vs. Sim(3) scale) -- prefer `optimized-anchor`
+  with a point-pair or ground-plane scale when you have one.
+- **`visual-aruco-motion-scale`** -- same many-keyframe detections, but
+  recovers scale from robust pairwise camera-motion-distance ratios instead
+  of the Sim(3) least-squares fit. Experimental; not used in the main
+  Ground/PointPair/Sim3 scale-method comparison.
+
 ## What It Does
 
 One tool, three stages, run together (each reuses what the previous one
 computes -- no need to invoke them separately):
 
-1. **Alignment.** Picks the marker id best seen by both cameras, picks each
-   camera's best-observed keyframe of that marker, runs `cv2.solvePnP`
-   against the marker's real geometry to get that keyframe's pose in the
-   marker frame, and combines it with that same keyframe's own SLAM-frame
-   pose (read from the raw CSV) to get one similarity transform (scale,
-   rotation, translation) per camera. That transform is applied to every
-   keyframe, giving each camera's full trajectory in the shared, metric,
-   marker-centered frame. Plots both trajectories.
+1. **Alignment**, via one of the three `--alignment-source` modes above.
+   Every mode ends with one similarity transform (scale, rotation,
+   translation) per camera, applied to every keyframe to give that camera's
+   full trajectory in the shared, metric, marker-centered frame. Plots both
+   trajectories.
 
 2. **Extrinsic calibration**, reusing stage 1's trajectories. Since the two
    cameras share no visual content, keyframes are matched by timestamp
    instead: for every camera2 keyframe, camera1's pose is interpolated
    (SLERP + linear) to that exact timestamp, and the relative pose is
-   computed at every match. Matches are filtered by distance from each
-   camera's own anchor keyframe (accuracy degrades with distance -- see
-   Notes), and the survivors are robustly averaged (SVD chordal mean for
-   rotation, per-axis median for translation) into the "averaged" extrinsic.
+   computed at every match. Matches are optionally filtered by distance/time
+   from each camera's reference keyframe (see Notes), and the survivors are
+   robustly averaged (SVD chordal mean for rotation, per-axis median for
+   translation) into the "averaged" extrinsic.
 
 3. **Joint optimization refinement**, reusing stage 2's surviving matches, in
    two variants:
@@ -90,14 +117,17 @@ prefix used when the run was recorded.)
 
 ```bash
 python3 tools/align_trajectories_to_aruco.py \
+  --alignment-source optimized-anchor \
   --camera1-name front \
   --camera1-points-csv results_agilex/<run_id>/aruco_scale/front/front_aruco_scale_points.csv \
   --camera1-raw-csv results_agilex/<run_id>/front_raw_keyframe_observations.csv \
   --camera1-config config/sim/agilex_front_defished_cam.yaml \
+  --camera1-scale 5.864969842432022 \
   --camera2-name left \
   --camera2-points-csv results_agilex/<run_id>/aruco_scale/left/left_aruco_scale_points.csv \
   --camera2-raw-csv results_agilex/<run_id>/left_raw_keyframe_observations.csv \
   --camera2-config config/sim/agilex_left_defished_cam.yaml \
+  --camera2-scale 4.0349409367671125 \
   --max-distance-from-anchor-m 1.0
 ```
 
@@ -110,16 +140,20 @@ Useful options:
 
 ```text
 --marker-id 3                     # force a marker instead of auto-selecting the best-shared one
---keyframe-candidates 5            # try this many top-by-point-count keyframes, keep lowest PnP RMS
 --marker-length-m 0.182            # marker side length, for the plot's marker outline only
---camera1-scale 5.864969842432022  # camera1's SLAM map scale (m per SLAM unit), e.g. from
-                                    # estimate_aruco_ground_plane_scale.py or a MATLAB ground-plane
-                                    # fit. If omitted, falls back to extracting it from marker point
-                                    # pairs at the anchor keyframe (see Notes).
+--camera1-scale 5.864969842432022  # camera1's SLAM map scale (m per SLAM unit), from
+                                    # estimate_aruco_slam_scale.py, estimate_aruco_ground_plane_scale.py,
+                                    # or a MATLAB ground-plane fit. Required for --alignment-source
+                                    # optimized-anchor; ignored (and unnecessary) for visual-aruco-sim3,
+                                    # which fits its own scale.
 --camera2-scale 4.0349409367671125 # same as --camera1-scale, for camera2
+--visual-aruco-min-detections 4    # minimum many-keyframe marker detections needed (sim3/optimized-anchor)
+--visual-aruco-max-rms-px 3.0      # reject a keyframe's marker PnP above this reprojection RMS
+--visual-aruco-trim-mad 3.5        # MAD cutoff for trimming rotation-fit outliers, 0 disables trimming
+--hide-anchor-marker               # don't draw the single reference-keyframe star in the trajectory plot
 --max-bracket-width-s 0.5          # drop matches where camera1's bracketing keyframes are farther
                                     # apart in time than this (usually matters little, see Notes)
---max-distance-from-anchor-m 1.0   # drop matches farther than this from either camera's own anchor
+--max-distance-from-anchor-m 1.0   # drop matches farther than this from either camera's reference
                                     # keyframe (the main quality knob, see Notes)
 --show                             # also display the plot interactively (it is always saved)
 --output-plot PATH                 # override the default save location (see below)
@@ -167,45 +201,34 @@ and all three final `T_<camera1>_<camera2>*` blocks.
 - **Marker coverage matters.** Pick (or let auto-selection pick) a marker
   actually seen by both cameras -- check the printed per-marker keyframe
   counts. A marker only one camera saw is useless for this.
-- **Visual marker fallback.** If a marker is visible in exported keyframe
-  images but ORB-SLAM did not reconstruct enough map points on the marker,
-  the alignment tool falls back to direct ArUco corner detections for that
-  camera's anchor keyframe. This lets the run continue, but if no external
-  `--camera*-scale` is supplied the camera uses unit SLAM scale and the
-  saved diagnostics mark `scale_ambiguous: True`. Rotations can still be
-  useful; translations involving that camera are not metric.
-- **Distance from the anchor keyframe, not timestamp gap, is the dominant
-  accuracy driver.** Each camera's transform is exact at its own anchor
-  keyframe and degrades slowly with distance from it (monocular SLAM has no
-  other metric constraint over a long loop). Always check the
-  `--max-distance-from-anchor-m` sensitivity table rather than assuming a
-  default cutoff is right for a new dataset.
-- **Validate against any ground truth you have.** Comparing to a known
-  extrinsic caught a real sign bug in an earlier version of
-  `relative_extrinsic()` (camera center vs. `tcw` translation vector -- they
-  are related by `t = -R @ C`, not interchangeable) that a purely internal
-  consistency check (spread across matches) did not reveal, since the bug
-  was a systematic bias, not noise.
-- **Stage 3 only differs from stage 2 when it matters.** On clean data (no
-  outlier matches) the Huber-loss joint fit and the chordal-mean/median
-  average land on essentially the same answer -- that's expected, not a bug;
-  Huber loss is designed to behave like ordinary least squares near the
-  bulk of the data and only downweight far-out residuals. Where it should
-  visibly help is exactly the case the hard `--max-distance-from-anchor-m`
-  cutoff exists for: a few still-drifted matches slipping past the cutoff.
-  If stage 3 moves far from stage 2 on a "clean" run, that itself is a
-  signal worth investigating (e.g. the cutoff is too loose), not something
-  to blindly trust just because it came from an optimizer.
-- By default, scale is extracted internally by comparing real distances
-  between marker points (from the marker's known physical size) to their
-  reconstructed SLAM distances, at the anchor keyframe -- see the point-pair
-  method in `estimate_aruco_slam_scale.py` / `README_scale_recovery.md`. Pass
-  `--camera1-scale`/`--camera2-scale` to override this per camera with a
-  scale from elsewhere instead (e.g. `recommended_scale_m_per_slam_unit`
-  from `estimate_aruco_ground_plane_scale.py`'s summary JSON, or a MATLAB
-  `estimate_ground_plane_from_atlas_csv.m` ground-plane-fit +
-  known-camera-height result) -- useful since the marker-point-pair method
-  can be noisy for small markers viewed from a distance, while ground-plane
-  fitting has a much larger effective baseline. The alignment JSON records
-  which source was used per camera (`scale_source`: `"external"`,
-  `"anchor_marker_points"`, or a unit-scale visual fallback source).
+- **`optimized-anchor` and `visual-aruco-sim3` expose one "reference"
+  keyframe** (the lowest-reprojection-RMS detection, `anchor_point`/`kf_id`
+  in the alignment JSON) for plotting and logging, but it does not define
+  the transform by itself -- rotation is the robust average over every kept
+  keyframe. Distance/time cutoffs are measured from that reference point as
+  a practical proxy for "near the marker."
+- **Distance from the reference keyframe, not timestamp gap, is usually the
+  dominant accuracy driver**, because monocular SLAM drift grows with
+  distance traveled and has no other metric constraint over a long loop.
+  Always check the `--max-distance-from-anchor-m` sensitivity table rather
+  than assuming a default cutoff is right for a new dataset.
+- **Validate against any ground truth you have** when one is available --
+  it's the only reliable check against a systematic bias (as opposed to
+  noise) in the pipeline, which an internal consistency check (spread across
+  matches) alone will not reveal.
+- **Stage 3 usually lands close to stage 2** on clean data (no outlier
+  matches) -- that's expected, since Huber loss behaves like ordinary least
+  squares near the bulk of the data and only downweights far-out residuals.
+  If stage 3 moves far from stage 2, treat that as a signal to revisit the
+  `--max-distance-from-anchor-m` cutoff rather than assuming the optimizer
+  found a better answer.
+- **Scale is never guessed for `optimized-anchor`.** It always comes from
+  `--camera1-scale`/`--camera2-scale` -- see the point-pair method in
+  `estimate_aruco_slam_scale.py`, the ground-plane method in
+  `estimate_aruco_ground_plane_scale.py`, or `README_scale_recovery.md`.
+  `visual-aruco-sim3` is the only mode that recovers scale on its own (per
+  camera, from the same many-keyframe fit as its rotation); pass
+  `--camera1-scale`/`--camera2-scale` to `visual-aruco-sim3` and they are
+  simply unused. The alignment JSON records which source was used per
+  camera (`scale_source`: `"external_optimized_anchor"` or the Sim(3)/motion
+  fit's own recovered value).

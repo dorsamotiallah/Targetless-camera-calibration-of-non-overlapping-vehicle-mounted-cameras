@@ -60,7 +60,12 @@ python3 tools/run_clean_aruco_calibration_from_scale.py \
 ```
 
 Use `--scale-source aruco-points`, `--scale-source ground`, or
-`--scale-source sim3`.
+`--scale-source sim3`. Internally, `aruco-points` and `ground` both run
+`align_trajectories_to_aruco.py --alignment-source optimized-anchor` (robust
+many-keyframe rotation fit, scale taken from the chosen recovery method), and
+`sim3` runs `--alignment-source visual-aruco-sim3` (fits its own scale and
+rotation jointly from the same many-keyframe detections). See
+`README_trajectory_extrinsic_calibration.md` for what each mode does.
 
 The old one-command wrappers were removed. Use this two-step workflow so scale
 recovery and calibration results stay separate and inspectable.

@@ -4,7 +4,7 @@ This runbook uses the existing automation scripts for Agilex PNG folders:
 
 - `tools/run_agilex_controlled_slam.sh`
 - `tools/run_agilex_controlled_calib.sh`
-- `NMC3D/tools/run_finnforest_nmc3d_calib.sh` with Agilex parameter overrides
+- `nmc3d/run_finnforest_nmc3d_calib.sh` with Agilex parameter overrides
 
 The controlled SLAM script starts `roscore`, runs orbcalib/ORB-SLAM in `slam`
 mode, publishes PNG frame pairs with ACK backpressure, stops ORB-SLAM with
@@ -31,7 +31,6 @@ docker run --rm -it \
   --env QT_X11_NO_MITSHM=1 \
   --volume /tmp/.X11-unix:/tmp/.X11-unix:rw \
   --volume "$HOME/Desktop/Dorsa/orbcalib-master":/ws/src/orbcalib-master \
-  --volume "$HOME/Desktop/Dorsa/NMC3D":/ws/src/NMC3D \
   --volume "$HOME/Desktop/Dorsa/Agilex Recordings":/ws/src/Agilex_Recordings \
   --volume "/media/civit/T7":/ws/src/T7 \
   --device /dev/dri:/dev/dri \
@@ -180,17 +179,6 @@ config/front_controlled_calib_load.yaml
 config/calib_agilex_calib.yaml
 ```
 
-To also copy the atlases into `NMC3D/results_agilex/<run_id>/`:
-
-```bash
-docker exec -it orbcalib bash -lc 'cd /ws/src/orbcalib-master && tools/run_agilex_controlled_calib.sh \
-  --run-id agilex_bigLoopNoTilt_back_front \
-  --camera1 back \
-  --camera2 front \
-  --export-nmc3d \
-  --nmc3d-dir /ws/src/NMC3D'
-```
-
 The useful orbcalib result is near the end of:
 
 ```text
@@ -199,46 +187,37 @@ results_agilex/agilex_bigLoopNoTilt_back_front/calib.log
 
 ## 6. NMC3D Calibration From The Same Agilex Atlases
 
-The current NMC3D helper is named for FinnForest and expects atlas aliases named
-`c1_atlas` and `c4_atlas`. Until there is a dedicated Agilex NMC3D helper, use
-the existing script with Agilex config overrides and symlink aliases.
-
-First export the orbcalib atlases to NMC3D:
-
-```bash
-docker exec -it orbcalib bash -lc 'cd /ws/src/orbcalib-master && tools/run_agilex_controlled_calib.sh \
-  --run-id agilex_bigLoopNoTilt_back_front \
-  --camera1 back \
-  --camera2 front \
-  --export-nmc3d \
-  --nmc3d-dir /ws/src/NMC3D'
-```
-
-Then run NMC3D calibration:
+`nmc3d/run_finnforest_nmc3d_calib.sh` is named for FinnForest and expects
+atlas aliases named `c1_atlas`/`c4_atlas`. Until there is a dedicated Agilex
+NMC3D helper, use the existing script with Agilex config overrides and
+symlink aliases -- pointed at the atlases `tools/run_agilex_controlled_calib.sh`
+already produced in `results_agilex/<run_id>/`. Since `nmc3d/` is part of
+this same project now, there is no export/copy step: just alias the
+already-there atlas files in place and run.
 
 ```bash
-docker exec -it orbcalib bash -lc 'source /opt/ros/noetic/setup.bash && \
-  cd /ws/src/NMC3D && \
-  RUN_DIR=/ws/src/NMC3D/results_agilex/agilex_bigLoopNoTilt_back_front && \
+docker exec -it orbcalib bash -lc 'cd /ws/src/orbcalib-master && \
+  source /opt/ros/noetic/setup.bash && \
+  RUN_DIR=results_agilex/agilex_bigLoopNoTilt_back_front && \
   ln -sf "back_atlasCamera 1.osa" "$RUN_DIR/c1_atlasCamera 1.osa" && \
   ln -sf "front_atlasCamera 2.osa" "$RUN_DIR/c4_atlasCamera 2.osa" && \
   CALIB_CONFIG=/ws/src/orbcalib-master/config/sim/calib_agilex.yaml \
   C1_CONFIG=/ws/src/orbcalib-master/config/sim/agilex_back_cam.yaml \
   C4_CONFIG=/ws/src/orbcalib-master/config/sim/agilex_front_cam.yaml \
-  tools/run_finnforest_nmc3d_calib.sh \
+  nmc3d/run_finnforest_nmc3d_calib.sh \
     --run-dir "$RUN_DIR"'
 ```
 
-To skip rebuilding NMC3D after it has already been built:
+To skip rebuilding `calib_nmc3d` once it has already been built:
 
 ```bash
-docker exec -it orbcalib bash -lc 'source /opt/ros/noetic/setup.bash && \
-  cd /ws/src/NMC3D && \
-  RUN_DIR=/ws/src/NMC3D/results_agilex/agilex_bigLoopNoTilt_back_front && \
+docker exec -it orbcalib bash -lc 'cd /ws/src/orbcalib-master && \
+  source /opt/ros/noetic/setup.bash && \
+  RUN_DIR=results_agilex/agilex_bigLoopNoTilt_back_front && \
   CALIB_CONFIG=/ws/src/orbcalib-master/config/sim/calib_agilex.yaml \
   C1_CONFIG=/ws/src/orbcalib-master/config/sim/agilex_back_cam.yaml \
   C4_CONFIG=/ws/src/orbcalib-master/config/sim/agilex_front_cam.yaml \
-  tools/run_finnforest_nmc3d_calib.sh \
+  nmc3d/run_finnforest_nmc3d_calib.sh \
     --run-dir "$RUN_DIR" \
     --skip-build'
 ```
@@ -246,7 +225,7 @@ docker exec -it orbcalib bash -lc 'source /opt/ros/noetic/setup.bash && \
 The NMC3D output is saved to:
 
 ```text
-NMC3D/results_agilex/agilex_bigLoopNoTilt_back_front/nmc3d_calib.log
+results_agilex/agilex_bigLoopNoTilt_back_front/nmc3d_calib.log
 ```
 
 ## 7. Reusing The Same Pattern

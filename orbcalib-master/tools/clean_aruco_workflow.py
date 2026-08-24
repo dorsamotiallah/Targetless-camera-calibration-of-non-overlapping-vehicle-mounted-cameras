@@ -103,6 +103,8 @@ def extract_aruco_points(
         str(args.marker_length_m),
         "--dictionary-size",
         str(args.dictionary_size),
+        "--dictionary-bits",
+        str(args.dictionary_bits),
         "--margin-px",
         str(args.margin_px),
         "--min-points",

@@ -3,7 +3,7 @@
 This runbook adds a reproducible, ACK-driven SLAM atlas-building path for
 FinnForest C1/C4.
 
-It does **not** replace [RUN_DOCKER_FINNFOREST.md](/home/civit/Desktop/Dorsa/orbcalib-master/RUN_DOCKER_FINNFOREST.md).
+It does **not** replace [RUN_DOCKER_FINNFOREST.md](RUN_DOCKER_FINNFOREST.md).
 The old `rosbag play` workflow still works.
 
 ## What This Adds
@@ -78,7 +78,6 @@ docker run --rm -it \
   --env QT_X11_NO_MITSHM=1 \
   --volume /tmp/.X11-unix:/tmp/.X11-unix:rw \
   --volume "$HOME/Desktop/Dorsa/orbcalib-master":/ws/src/orbcalib-master \
-  --volume "$HOME/Desktop/Dorsa/NMC3D":/ws/src/NMC3D \
   --device /dev/dri:/dev/dri \
   orbcalib-noetic bash
 ```
@@ -128,16 +127,16 @@ c4_atlasCamera 2.osa
 The atlases are saved directly inside the run folder, so they do not overwrite
 old atlases in the repo root.
 
-## To see the live slam logs run this command in another terminal:
+## To see the live slam logs run this command in another terminal (from the host):
 
-```
-tail -f /home/civit/Desktop/Dorsa/orbcalib-master/results_finnforest/40Hz_Controlled_Slam/slam.log
+```bash
+tail -f "$HOME/Desktop/Dorsa/orbcalib-master/results_finnforest/40Hz_Controlled_Slam/slam.log"
 ```
 
-and this player log in another termina: 
+and this player log in another terminal:
 
-```
-tail -f /home/civit/Desktop/Dorsa/orbcalib-master/results_finnforest/40Hz_Controlled_Slam/player.log
+```bash
+tail -f "$HOME/Desktop/Dorsa/orbcalib-master/results_finnforest/40Hz_Controlled_Slam/player.log"
 ```
 
 ## Useful Options
@@ -181,22 +180,16 @@ docker exec -it orbcalib bash -lc 'cd /ws/src/orbcalib-master && tools/run_finnf
 The helper:
 
 1. verifies the run folder contains C1/C4 atlases,
-2. copies the same atlases to `NMC3D/results_finnforest/<run_id>/` when
-   `/ws/src/NMC3D` is mounted,
-3. creates temporary load configs inside the run folder,
-4. points those configs at that run's atlas prefixes,
-5. runs orbcalib in `calib` mode,
-6. saves the calibration output as `calib.log` in the same run folder,
-7. appends calibration metadata to `manifest.txt`.
+2. creates temporary load configs inside the run folder,
+3. points those configs at that run's atlas prefixes,
+4. runs orbcalib in `calib` mode,
+5. saves the calibration output as `calib.log` in the same run folder,
+6. appends calibration metadata to `manifest.txt`.
 
-If your existing `orbcalib` container was started before the NMC3D volume was
-added, atlas export will be skipped with a clear message. Restart the container
-with the `--volume "$HOME/Desktop/Dorsa/NMC3D":/ws/src/NMC3D` line above, or
-pass the path explicitly if it is mounted somewhere else:
-
-```bash
-docker exec -it orbcalib bash -lc 'cd /ws/src/orbcalib-master && tools/run_finnforest_controlled_calib.sh --run-id 40Hz_Controlled_Slam --nmc3d-dir /ws/src/NMC3D'
-```
+To also run the NMC3D depth-balanced variant on the same atlases, see
+"Run NMC3D Calibration From The Same Run" below -- `nmc3d/` reads directly
+from this same `results_finnforest/<run_id>` folder, no separate mount or
+copy step needed.
 
 Example generated atlas load path:
 
@@ -229,38 +222,31 @@ as the meaningful result, as in the earlier FinnForest runs.
 
 ## Run NMC3D Calibration From The Same Run
 
-After the orbcalib calibration helper has exported the atlases, NMC3D should
-contain:
+The `../calib` calibration helper above already left the atlases in
+`results_finnforest/<run_id>/` inside this same `orbcalib-master` tree --
+`nmc3d/` reads them directly, no export or second container needed:
 
 ```text
-/home/civit/Desktop/Dorsa/NMC3D/results_finnforest/<run_id>/
+results_finnforest/<run_id>/
   c1_atlasCamera 1.osa
   c4_atlasCamera 2.osa
 ```
 
-Run the NMC3D calibration automation from the host:
+Run the NMC3D calibration automation in the same `orbcalib` container:
 
 ```bash
-cd /home/civit/Desktop/Dorsa/NMC3D
-
-docker run --rm -it \
-  --user "$(id -u):$(id -g)" \
-  --network host \
-  --ipc=host \
-  -e HOME=/tmp \
-  -v /home/civit/Desktop/Dorsa/NMC3D:/ws/src/NMC3D \
-  orbcalib-noetic bash -lc '
-    cd /ws/src/NMC3D
-    tools/run_finnforest_nmc3d_calib.sh --run-id 40Hz_Controlled_Slam
-  '
+docker exec -it orbcalib bash -lc '
+  cd /ws/src/orbcalib-master
+  nmc3d/run_finnforest_nmc3d_calib.sh --run-id 40Hz_Controlled_Slam
+'
 ```
 
 This writes:
 
 ```text
-NMC3D/results_finnforest/<run_id>/nmc3d_calib.log
-NMC3D/results_finnforest/<run_id>/roscore_nmc3d_calib.log
-NMC3D/results_finnforest/<run_id>/config/
+results_finnforest/<run_id>/nmc3d_calib.log
+results_finnforest/<run_id>/roscore_nmc3d_calib.log
+results_finnforest/<run_id>/config/
 ```
 
 ## Notes

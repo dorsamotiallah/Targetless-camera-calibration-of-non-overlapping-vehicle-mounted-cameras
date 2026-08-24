@@ -3,6 +3,35 @@
 These commands are intended to run inside the `orbcalib-noetic` Docker
 container, where the repo is mounted at `/ws/src/orbcalib-master`.
 
+## Start Docker Container
+
+Run this from the host before using the commands below:
+
+```bash
+cd ~/Desktop/Dorsa/orbcalib-master
+
+xhost +local:docker
+
+docker rm -f orbcalib 2>/dev/null || true
+
+docker run --rm -it \
+  --name orbcalib \
+  --user "$(id -u):$(id -g)" \
+  --network host \
+  --ipc=host \
+  --env DISPLAY="$DISPLAY" \
+  --env HOME=/tmp \
+  --env QT_X11_NO_MITSHM=1 \
+  --volume /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  --volume "$HOME/Desktop/Dorsa/orbcalib-master":/ws/src/orbcalib-master \
+  --volume "/media/civit/T7":/ws/src/T7 \
+  --device /dev/dri:/dev/dri \
+  orbcalib-noetic bash
+```
+
+The controlled SLAM and calibration scripts start and stop `roscore`
+themselves, so a separate manual `roscore` is not needed for normal runs.
+
 ## Build
 
 After code changes, rebuild the calibration executable:
@@ -12,6 +41,9 @@ cd /ws/src/orbcalib-master
 source /opt/ros/noetic/setup.bash
 cmake --build build --target calib -j$(nproc)
 ```
+
+To also build the NMC3D depth-balanced variant (see `../nmc3d/README.md`),
+add `--target calib_nmc3d`, or omit `--target` to build everything.
 
 ## 1. Build Atlases With Controlled SLAM
 

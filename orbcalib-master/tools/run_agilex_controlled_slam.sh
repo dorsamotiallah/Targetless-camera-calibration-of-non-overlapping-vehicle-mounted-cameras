@@ -144,7 +144,7 @@ require_file() {
 require_dir() {
   if [[ ! -d "$1" ]]; then
     echo "Missing required directory: $1" >&2
-    echo "If this is the Robot dataset, mount it into the container, e.g. -v /home/civit/Desktop/Dorsa/Robot:/ws/src/Robot" >&2
+    echo "If this is the Robot dataset, mount it into the container, e.g. -v \"\$HOME/Desktop/Dorsa/Robot\":/ws/src/Robot" >&2
     exit 1
   fi
 }

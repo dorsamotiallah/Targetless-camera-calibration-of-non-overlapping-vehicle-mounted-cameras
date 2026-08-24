@@ -18,8 +18,6 @@ RESULTS_ROOT=${RESULTS_ROOT:-"$REPO_DIR/results_agilex"}
 RESULTS_CHMOD=${RESULTS_CHMOD:-a+rwX}
 HOST_UID=${HOST_UID:-}
 HOST_GID=${HOST_GID:-$HOST_UID}
-NMC3D_DIR=${NMC3D_DIR:-}
-EXPORT_NMC3D=${EXPORT_NMC3D:-0}
 USE_VIEWER=${USE_VIEWER:-}
 USE_GLOBAL_MAP_SCALES=${USE_GLOBAL_MAP_SCALES:-}
 CAMERA1_GLOBAL_SCALE=${CAMERA1_GLOBAL_SCALE:-}
@@ -39,8 +37,6 @@ Options:
   --camera2 NAME          Camera 2 atlas prefix name. Default: $CAMERA2_NAME
   --camera1-config PATH   ORB-SLAM camera config for camera 1.
   --camera2-config PATH   ORB-SLAM camera config for camera 2.
-  --nmc3d-dir PATH        Optional NMC3D repo path where atlases should be copied.
-  --export-nmc3d          Copy atlases into NMC3D/results_agilex/<run_id>.
   --viewer                Enable ORB-SLAM Pangolin viewer for this run.
   --no-viewer             Disable ORB-SLAM Pangolin viewer for this run.
   --use-global-map-scales Enable metric map scales during calibration.
@@ -67,8 +63,6 @@ while [[ $# -gt 0 ]]; do
     --camera2) CAMERA2_NAME="$2"; shift 2 ;;
     --camera1-config) CAMERA1_CONFIG="$2"; CAMERA1_CONFIG_EXPLICIT=1; shift 2 ;;
     --camera2-config) CAMERA2_CONFIG="$2"; CAMERA2_CONFIG_EXPLICIT=1; shift 2 ;;
-    --nmc3d-dir) NMC3D_DIR="$2"; shift 2 ;;
-    --export-nmc3d) EXPORT_NMC3D=1; shift ;;
     --viewer) USE_VIEWER=1; shift ;;
     --no-viewer) USE_VIEWER=0; shift ;;
     --use-global-map-scales) USE_GLOBAL_MAP_SCALES=1; shift ;;
@@ -223,25 +217,6 @@ make_calib_config() {
   ' "$src" > "$dst"
 }
 
-export_atlases_to_nmc3d() {
-  if [[ "$EXPORT_NMC3D" != "1" ]]; then
-    return
-  fi
-  if [[ -z "$NMC3D_DIR" ]]; then
-    if [[ -d /ws/src/NMC3D ]]; then
-      NMC3D_DIR=/ws/src/NMC3D
-    else
-      echo "NMC3D export skipped: NMC3D repo is not visible. Use --nmc3d-dir PATH." >&2
-      return
-    fi
-  fi
-  local nmc_run_dir="$NMC3D_DIR/results_agilex/$(basename "$RUN_DIR")"
-  mkdir -p "$nmc_run_dir"
-  cp -p "$CAMERA1_ATLAS_FILE" "$nmc_run_dir/$(basename "$CAMERA1_ATLAS_FILE")"
-  cp -p "$CAMERA2_ATLAS_FILE" "$nmc_run_dir/$(basename "$CAMERA2_ATLAS_FILE")"
-  echo "nmc3d_export_dest=$nmc_run_dir" >> "$RUN_DIR/manifest.txt"
-}
-
 require_file "$VOCAB_PATH"
 require_file "$CALIB_CONFIG"
 require_file "$CAMERA1_CONFIG"
@@ -254,8 +229,6 @@ CAMERA1_ATLAS_FILE="$REPO_DIR/${CAMERA1_ATLAS_PREFIX}Camera 1.osa"
 CAMERA2_ATLAS_FILE="$REPO_DIR/${CAMERA2_ATLAS_PREFIX}Camera 2.osa"
 require_file "$CAMERA1_ATLAS_FILE"
 require_file "$CAMERA2_ATLAS_FILE"
-
-export_atlases_to_nmc3d
 
 mkdir -p "$RUN_DIR/config"
 if [[ "$USE_GLOBAL_MAP_SCALES" == "1" ]]; then

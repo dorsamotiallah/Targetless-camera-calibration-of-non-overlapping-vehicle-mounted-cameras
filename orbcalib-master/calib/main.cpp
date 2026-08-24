@@ -32,6 +32,19 @@
 
 #include<opencv2/core/core.hpp>
 
+#include <X11/Xlib.h>
+// X11 headers #define several short, generic macro names (Success, Status,
+// None, Bool, True, False) that collide with identically-named identifiers
+// in Eigen/OpenCV/g2o (e.g. Eigen::Success, cv::Stitcher::Status), pulled
+// in via the ORB-SLAM3/g2o headers below. Undefine them immediately so
+// they can't corrupt unrelated template/enum code.
+#undef Success
+#undef Status
+#undef None
+#undef Bool
+#undef True
+#undef False
+
 #include "System.h"
 #include "calib.hpp"
 
@@ -153,6 +166,13 @@ public:
 
 int main(int argc, char **argv)
 {
+    // SLAM1 and SLAM2 each spawn their own Viewer thread, and each Viewer
+    // thread calls pangolin::CreateWindowAndBind() (raw Xlib/GLX calls).
+    // Xlib is not thread-safe unless XInitThreads() is called before any
+    // other Xlib call, so without this, running two viewers at once is a
+    // race that reliably hangs whichever window was created first.
+    XInitThreads();
+
     ros::init(argc, argv, "calib_node");
     ros::start();
 

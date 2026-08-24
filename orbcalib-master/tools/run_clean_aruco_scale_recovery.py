@@ -64,6 +64,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--marker-length-m", type=float, default=0.182)
     parser.add_argument("--dictionary-size", type=int, default=50)
+    parser.add_argument(
+        "--dictionary-bits",
+        type=int,
+        default=6,
+        choices=(4, 5, 6, 7),
+        help="ArUco marker grid size. Default: 6 for DICT_6X6_*.",
+    )
     parser.add_argument("--margin-px", type=float, default=0.0)
     parser.add_argument("--min-points", type=int, default=4)
     parser.add_argument("--min-real-distance-m", type=float)
@@ -131,6 +138,7 @@ def recover_sim3_scale(
         calib,
         args.marker_length_m,
         args.dictionary_size,
+        args.dictionary_bits,
         trajectory,
         args.visual_aruco_max_rms_px,
         args.visual_aruco_max_keyframes,

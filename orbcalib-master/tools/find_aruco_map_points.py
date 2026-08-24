@@ -43,7 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera2-dir", type=Path, help="Override camera 2 PNG directory")
     parser.add_argument("--stage", default="projection_after_optimized_pose", help="CSV stage to inspect")
     parser.add_argument("--marker-id", type=int, action="append", help="Marker id to keep. Can be repeated.")
-    parser.add_argument("--dictionary-size", type=int, default=50, help="OpenCV 6x6 dictionary size. Default: 50")
+    parser.add_argument("--dictionary-size", type=int, default=50, help="OpenCV ArUco dictionary size. Default: 50")
+    parser.add_argument(
+        "--dictionary-bits",
+        type=int,
+        default=6,
+        choices=(4, 5, 6, 7),
+        help="ArUco marker grid size. Default: 6 for DICT_6X6_*.",
+    )
     parser.add_argument("--margin-px", type=float, default=8.0, help="Include points this far outside marker polygon.")
     parser.add_argument("--min-points", type=int, default=3, help="Only report marker/keyframes with at least this many points.")
     parser.add_argument("--max-keyframes", type=int, help="Stop after checking this many keyframes.")
@@ -241,7 +248,7 @@ def main() -> int:
             args.frame_id_offset,
             not args.no_frame_id_wrap,
         )
-        corners_list, ids, _ = detect_markers(image, args.dictionary_size)
+        corners_list, ids, _ = detect_markers(image, args.dictionary_size, args.dictionary_bits)
         if ids is None or len(ids) == 0:
             continue
 

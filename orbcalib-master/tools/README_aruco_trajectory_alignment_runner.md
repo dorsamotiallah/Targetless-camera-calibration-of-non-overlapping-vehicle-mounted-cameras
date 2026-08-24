@@ -7,8 +7,10 @@ It runs:
 
 1. `estimate_aruco_slam_scale.py` for camera 1
 2. `estimate_aruco_slam_scale.py` for camera 2
-3. `align_trajectories_to_aruco.py` using the generated ArUco point CSVs and
-   extracted recommended scales
+3. `align_trajectories_to_aruco.py --alignment-source optimized-anchor`, using
+   the generated ArUco point CSVs and each camera's recommended point-pair
+   scale (both cameras must recover a scale, or the script exits before
+   running alignment -- see `README_trajectory_extrinsic_calibration.md`)
 
 By default, trajectory matching uses original source PNG timestamps recovered
 from `frame_pairs.csv`, not the ROS playback timestamps in the raw CSV. This

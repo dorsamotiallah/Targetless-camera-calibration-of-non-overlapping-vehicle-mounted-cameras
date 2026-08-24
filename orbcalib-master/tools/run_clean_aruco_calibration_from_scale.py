@@ -39,7 +39,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-id", type=int, action="append", help="Force marker id. Can be repeated.")
     parser.add_argument("--marker-length-m", type=float, default=0.182)
     parser.add_argument("--dictionary-size", type=int, default=50)
-    parser.add_argument("--keyframe-candidates", type=int, default=5)
+    parser.add_argument(
+        "--dictionary-bits",
+        type=int,
+        default=6,
+        choices=(4, 5, 6, 7),
+        help="ArUco marker grid size. Default: 6 for DICT_6X6_*.",
+    )
     parser.add_argument("--visual-aruco-min-detections", type=int, default=4)
     parser.add_argument("--visual-aruco-max-rms-px", type=float, default=3.0)
     parser.add_argument("--visual-aruco-max-keyframes", type=int)
@@ -130,10 +136,10 @@ def build_alignment_cmd(
         str(args.marker_length_m),
         "--dictionary-size",
         str(args.dictionary_size),
+        "--dictionary-bits",
+        str(args.dictionary_bits),
         "--alignment-source",
         alignment_source,
-        "--keyframe-candidates",
-        str(args.keyframe_candidates),
         "--visual-aruco-min-detections",
         str(args.visual_aruco_min_detections),
         "--visual-aruco-max-rms-px",
@@ -200,11 +206,11 @@ def main() -> int:
     camera1_scale: Optional[float] = None
     camera2_scale: Optional[float] = None
     if args.scale_source == "aruco-points":
-        alignment_source = "anchor"
+        alignment_source = "optimized-anchor"
         camera1_scale = load_aruco_points_scale(args.scale_root, args.camera1)
         camera2_scale = load_aruco_points_scale(args.scale_root, args.camera2)
     elif args.scale_source == "ground":
-        alignment_source = "anchor"
+        alignment_source = "optimized-anchor"
         camera1_scale = load_ground_scale(args.scale_root, args.camera1)
         camera2_scale = load_ground_scale(args.scale_root, args.camera2)
     else:

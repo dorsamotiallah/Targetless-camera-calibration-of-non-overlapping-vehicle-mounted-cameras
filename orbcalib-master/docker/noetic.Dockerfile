@@ -25,6 +25,6 @@ RUN git clone https://github.com/stevenlovegrove/Pangolin.git /tmp/Pangolin && \
     cmake --install /tmp/Pangolin/build && \
     rm -rf /tmp/Pangolin
 
-RUN python3 -m pip install --no-cache-dir mcap-ros2-support numpy
+RUN python3 -m pip install --no-cache-dir mcap-ros2-support "numpy>=1.19.5,<1.27" scipy
 
 WORKDIR /ws

@@ -63,7 +63,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--marker-length-m", type=float, required=True, help="Physical ArUco marker side length in meters.")
-    parser.add_argument("--dictionary-size", type=int, default=50, help="OpenCV 6x6 dictionary size. Default: 50")
+    parser.add_argument("--dictionary-size", type=int, default=50, help="OpenCV ArUco dictionary size. Default: 50")
+    parser.add_argument(
+        "--dictionary-bits",
+        type=int,
+        default=6,
+        choices=(4, 5, 6, 7),
+        help="ArUco marker grid size. Default: 6 for DICT_6X6_*.",
+    )
     parser.add_argument("--marker-id", type=int, action="append", help="Marker id to keep. Can be repeated.")
     parser.add_argument("--margin-px", type=float, default=0.0, help="Include points this far outside marker polygon.")
     parser.add_argument("--min-points", type=int, default=4, help="Minimum selected points for a marker observation.")
@@ -317,7 +324,7 @@ def main() -> int:
             avg_focal = 0.5 * (float(image_calib.K[0, 0]) + float(image_calib.K[1, 1]))
             margin_geometry = args.margin_px / avg_focal if avg_focal > 0.0 else 0.0
 
-        corners_list, ids, _ = detect_markers(image, args.dictionary_size)
+        corners_list, ids, _ = detect_markers(image, args.dictionary_size, args.dictionary_bits)
         if ids is None or len(ids) == 0:
             continue
 
@@ -488,7 +495,7 @@ def main() -> int:
         "camera_config": str(args.camera_config.resolve()) if args.camera_config else None,
         "camera_model": base_calib.model if base_calib is not None else "raw_pixel",
         "geometry_domain": "undistorted_normalized" if base_calib is not None else "raw_pixel",
-        "aruco_dictionary": dictionary_name(args.dictionary_size),
+        "aruco_dictionary": dictionary_name(args.dictionary_size, args.dictionary_bits),
         "marker_length_m": args.marker_length_m,
         "marker_ids": sorted(marker_filter) if marker_filter is not None else "all",
         "margin_px": args.margin_px,

@@ -66,7 +66,6 @@ import argparse
 import bisect
 import csv
 import json
-from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -114,25 +113,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--alignment-source",
-        choices=("anchor", "visual-aruco-sim3", "visual-aruco-motion-scale"),
-        default="anchor",
-        help="How to align each SLAM map to the marker frame. 'anchor' uses one marker anchor keyframe "
-        "and a supplied/recovered scale. 'visual-aruco-sim3' detects the marker in many keyframes, "
-        "solves metric PnP for each, and fits a robust Sim(3) from SLAM camera centers to visual "
-        "ArUco camera centers. 'visual-aruco-motion-scale' uses the same visual detections, recovers "
-        "scale from robust pairwise camera-motion ratios, then fits rotation/translation. Default: anchor.",
+        choices=("visual-aruco-sim3", "visual-aruco-motion-scale", "optimized-anchor"),
+        required=True,
+        help="How to align each SLAM map to the marker frame. 'visual-aruco-sim3' detects the marker "
+        "in many keyframes, solves metric PnP for each, and fits a robust Sim(3) from SLAM camera "
+        "centers to visual ArUco camera centers -- this both fits rotation and recovers its own scale. "
+        "'visual-aruco-motion-scale' uses the same visual detections, recovers scale from robust "
+        "pairwise camera-motion ratios, then fits rotation/translation. 'optimized-anchor' detects the "
+        "marker in many keyframes like visual-aruco-sim3 and fits the same robust (MAD-trimmed, "
+        "chordal-mean) rotation from all of them, but takes the metric scale from a required "
+        "--camera1-scale/--camera2-scale value (e.g. a ground-plane or point-pair scale recovery) "
+        "instead of fitting its own scale -- use this for any externally-supplied scale source. There "
+        "is no single-anchor-keyframe option: a single keyframe's PnP solve has no protection against "
+        "outliers (e.g. the planar-marker pose ambiguity) and was superseded by 'optimized-anchor', "
+        "which is exactly as cheap to supply scale to but robust to any one bad keyframe.",
     )
     parser.add_argument(
         "--dictionary-size",
         type=int,
         default=50,
-        help="OpenCV 6x6 ArUco dictionary size used by the visual fallback. Default: 50.",
+        help="OpenCV ArUco dictionary size used by the visual fallback. Default: 50.",
     )
     parser.add_argument(
-        "--keyframe-candidates",
+        "--dictionary-bits",
         type=int,
-        default=5,
-        help="Try this many top by-point-count keyframes per camera and keep the one with the lowest marker PnP reprojection RMS.",
+        default=6,
+        choices=(4, 5, 6, 7),
+        help="ArUco marker grid size used by the visual fallback. Default: 6 for DICT_6X6_*.",
     )
     parser.add_argument(
         "--visual-aruco-min-detections",
@@ -241,6 +248,13 @@ def parse_args() -> argparse.Namespace:
         "<run-dir>/aruco_alignment/<camera1>_<camera2>_extrinsic.yaml.",
     )
     parser.add_argument("--show", action="store_true", help="Also show the plot interactively (it is always saved).")
+    parser.add_argument(
+        "--hide-anchor-marker",
+        action="store_true",
+        help="Don't draw the single starred anchor/reference keyframe in the trajectory plots. The "
+        "SLAM-to-marker transform is derived from many keyframes (not one), so a single starred point "
+        "would misleadingly suggest otherwise. The plot then shows just the trajectories and the marker.",
+    )
     parser.add_argument(
         "--raw-ros-timestamps",
         action="store_true",
@@ -399,59 +413,21 @@ def solve_pnp(
     raise RuntimeError(f"solvePnP failed for all flags tried (last error: {last_error})")
 
 
-def select_best_keyframe(
-    name: str,
-    rows: List[Dict[str, float]],
-    marker_id: int,
-    calib: CameraCalibration,
-    top_k: int,
-) -> Tuple[int, int]:
-    """Take the top-k keyframes by marker point count, run the marker-only PnP
-    for each, and keep whichever gives the lowest reprojection RMS."""
-    counts = Counter(row["kf_id"] for row in rows if row["marker_id"] == marker_id)
-    if not counts:
-        raise ValueError(f"No keyframes observed marker_id={marker_id}")
-
-    candidates = counts.most_common(top_k)
-    print(f"{name}: evaluating {len(candidates)} keyframe candidate(s) for marker {marker_id}")
-
-    best: Optional[Tuple[int, int, float]] = None
-    for kf_id, num_points in candidates:
-        marker_rows = [row for row in rows if row["marker_id"] == marker_id and row["kf_id"] == kf_id]
-        real_points = np.array([[r["marker_x_m"], r["marker_y_m"], 0.0] for r in marker_rows])
-        image_points = np.array([[r["u"], r["v"]] for r in marker_rows])
-        try:
-            _, _, rms_px = solve_pnp(real_points, image_points, calib, prefer_planar=True)
-        except RuntimeError as exc:
-            print(f"  kf{kf_id}: {num_points} pts, PnP failed ({exc})")
-            continue
-        print(f"  kf{kf_id}: {num_points} pts, marker PnP RMS = {rms_px:.3f}px")
-        if best is None or rms_px < best[2]:
-            best = (kf_id, num_points, rms_px)
-
-    if best is None:
-        raise ValueError(f"All keyframe candidates for marker {marker_id} failed PnP")
-
-    kf_id, num_points, rms_px = best
-    print(f"{name}: selected kf_id={kf_id} ({num_points} pts, RMS={rms_px:.3f}px)")
-    return kf_id, num_points
-
-
-def aruco_dictionary(dictionary_size: int) -> object:
-    names = {
-        50: "DICT_6X6_50",
-        100: "DICT_6X6_100",
-        250: "DICT_6X6_250",
-        1000: "DICT_6X6_1000",
-    }
-    name = names.get(dictionary_size)
-    if name is None:
-        raise ValueError(f"Unsupported 6x6 ArUco dictionary size: {dictionary_size}")
+def aruco_dictionary(dictionary_size: int, dictionary_bits: int = 6) -> object:
+    if dictionary_size not in (50, 100, 250, 1000):
+        raise ValueError(f"Unsupported ArUco dictionary size: {dictionary_size}")
+    name = f"DICT_{dictionary_bits}X{dictionary_bits}_{dictionary_size}"
+    if not hasattr(cv2.aruco, name):
+        raise ValueError(f"Unsupported ArUco dictionary: {dictionary_bits}x{dictionary_bits}_{dictionary_size}")
     return cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
 
 
-def detect_markers(image: np.ndarray, dictionary_size: int) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
-    dictionary = aruco_dictionary(dictionary_size)
+def detect_markers(
+    image: np.ndarray,
+    dictionary_size: int,
+    dictionary_bits: int = 6,
+) -> Tuple[List[np.ndarray], Optional[np.ndarray]]:
+    dictionary = aruco_dictionary(dictionary_size, dictionary_bits)
     try:
         detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
         corners, ids, _ = detector.detectMarkers(image)
@@ -540,123 +516,6 @@ def polygon_area(points: np.ndarray) -> float:
     x = pts[:, 0]
     y = pts[:, 1]
     return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
-def select_visual_keyframe(
-    name: str,
-    raw_csv_path: Path,
-    marker_id: int,
-    calib: CameraCalibration,
-    marker_length_m: float,
-    dictionary_size: int,
-    top_k: int,
-) -> Dict[str, object]:
-    keyframes = load_keyframe_rows(raw_csv_path)
-    object_points = marker_corner_object_points(marker_length_m)
-    detections: List[Tuple[int, float, np.ndarray, Path]] = []
-
-    for kf_id, raw_row in sorted(keyframes.items()):
-        try:
-            image_path = image_for_keyframe(raw_csv_path, name, raw_row)
-        except (ValueError, FileNotFoundError):
-            continue
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            continue
-        corners_list, ids = detect_markers(image, dictionary_size)
-        if ids is None:
-            continue
-        for corners, detected_id in zip(corners_list, ids.reshape(-1)):
-            if int(detected_id) == marker_id:
-                detections.append((kf_id, polygon_area(corners), corners.reshape(4, 2).astype(np.float64), image_path))
-
-    if not detections:
-        raise ValueError(f"{name}: marker_id={marker_id} is not visually detected in any exported keyframe")
-
-    candidates = sorted(detections, key=lambda item: item[1], reverse=True)[:top_k]
-    print(
-        f"{name}: no usable SLAM marker points; evaluating {len(candidates)} visual ArUco "
-        f"keyframe candidate(s) out of {len(detections)} detection(s)"
-    )
-
-    best: Optional[Tuple[int, int, float, float, np.ndarray, Path]] = None
-    for kf_id, area_px2, corners, image_path in candidates:
-        try:
-            _, _, rms_px = solve_pnp(object_points, corners, calib, prefer_planar=True)
-        except RuntimeError as exc:
-            print(f"  kf{kf_id}: visual corners, area={area_px2:.1f}px^2, PnP failed ({exc})")
-            continue
-        print(
-            f"  kf{kf_id}: visual corners, area={area_px2:.1f}px^2, "
-            f"marker PnP RMS = {rms_px:.3f}px, image={image_path.name}"
-        )
-        if best is None or area_px2 > best[3]:
-            best = (kf_id, 4, rms_px, area_px2, corners, image_path)
-
-    if best is None:
-        raise ValueError(f"{name}: all visual marker candidates for marker_id={marker_id} failed PnP")
-
-    kf_id, num_points, rms_px, area_px2, corners, image_path = best
-    print(
-        f"{name}: selected kf_id={kf_id} from visual marker corners "
-        f"({num_points} corners, area={area_px2:.1f}px^2, RMS={rms_px:.3f}px, image={image_path.name})"
-    )
-    return {
-        "kf_id": kf_id,
-        "real_points": object_points,
-        "image_points": corners,
-        "slam_points": None,
-        "num_marker_points": 0,
-        "num_visual_corners": 4,
-        "marker_pnp_input": "visual_aruco_corners",
-        "visual_marker_keyframes": len({item[0] for item in detections}),
-        "visual_marker_detections": len(detections),
-        "image_path": str(image_path),
-    }
-
-
-def select_anchor_observation(
-    name: str,
-    rows: List[Dict[str, float]],
-    marker_id: int,
-    raw_csv_path: Path,
-    calib: CameraCalibration,
-    marker_length_m: float,
-    dictionary_size: int,
-    top_k: int,
-) -> Dict[str, object]:
-    counts = Counter(row["kf_id"] for row in rows if row["marker_id"] == marker_id)
-    enough_point_rows = sum(count for count in counts.values() if count >= 4)
-    if counts and enough_point_rows:
-        kf_id, _ = select_best_keyframe(name, rows, marker_id, calib, top_k)
-        marker_rows = [row for row in rows if row["marker_id"] == marker_id and row["kf_id"] == kf_id]
-        return {
-            "kf_id": kf_id,
-            "real_points": np.array([[r["marker_x_m"], r["marker_y_m"], 0.0] for r in marker_rows]),
-            "image_points": np.array([[r["u"], r["v"]] for r in marker_rows]),
-            "slam_points": np.array([[r["mp_x"], r["mp_y"], r["mp_z"]] for r in marker_rows]),
-            "num_marker_points": len(marker_rows),
-            "num_visual_corners": 0,
-            "marker_pnp_input": "slam_marker_points",
-            "visual_marker_keyframes": None,
-            "visual_marker_detections": None,
-            "image_path": None,
-        }
-
-    point_count = sum(counts.values())
-    print(
-        f"{name}: marker_id={marker_id} has only {point_count} SLAM marker point observation(s) "
-        f"across {len(counts)} keyframe(s), fewer than the 4 needed for marker-point PnP/scale."
-    )
-    return select_visual_keyframe(
-        name,
-        raw_csv_path,
-        marker_id,
-        calib,
-        marker_length_m,
-        dictionary_size,
-        top_k,
-    )
 
 
 def quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
@@ -814,127 +673,6 @@ def load_trajectory(
     return trajectory, timestamp_source
 
 
-def estimate_scale(real_points: np.ndarray, slam_points: np.ndarray) -> float:
-    n = len(real_points)
-    ratios: List[float] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            real_dist = float(np.linalg.norm(real_points[i] - real_points[j]))
-            slam_dist = float(np.linalg.norm(slam_points[i] - slam_points[j]))
-            if real_dist > 1e-4 and slam_dist > 1e-7:
-                ratios.append(real_dist / slam_dist)
-    if not ratios:
-        raise ValueError("Could not estimate scale: no usable point pairs")
-    return float(np.median(ratios))
-
-
-def align_camera(
-    name: str,
-    marker_id: int,
-    anchor: Dict[str, object],
-    raw_csv_path: Path,
-    calib: CameraCalibration,
-    external_scale: Optional[float] = None,
-    use_source_timestamps: bool = True,
-) -> Dict[str, object]:
-    kf_id = int(anchor["kf_id"])
-    real_points = np.asarray(anchor["real_points"], dtype=np.float64)
-    image_points_marker = np.asarray(anchor["image_points"], dtype=np.float64)
-    slam_points_marker = anchor["slam_points"]
-    if slam_points_marker is not None:
-        slam_points_marker = np.asarray(slam_points_marker, dtype=np.float64)
-
-    R_marker, t_marker, err_marker_px = solve_pnp(real_points, image_points_marker, calib, prefer_planar=True)
-    print(
-        f"{name}: marker PnP reprojection RMS = {err_marker_px:.3f}px "
-        f"({len(image_points_marker)} {anchor['marker_pnp_input']})"
-    )
-
-    trajectory, timestamp_source = load_trajectory(raw_csv_path, name, use_source_timestamps)
-    print(f"{name}: trajectory timestamps = {timestamp_source}")
-    if kf_id not in trajectory:
-        raise ValueError(f"{name}: kf_id={kf_id} not found in {raw_csv_path}")
-
-    scale_warning: Optional[str] = None
-    if external_scale is not None:
-        scale = external_scale
-        print(f"{name}: using provided scale = {scale:.6f} m per SLAM unit (not extracted from anchor keyframe)")
-        scale_source = "external"
-        scale_recovered = True
-    elif slam_points_marker is not None and len(slam_points_marker) >= 4:
-        try:
-            scale = estimate_scale(real_points, slam_points_marker)
-            print(f"{name}: recovered scale = {scale:.6f} m per SLAM unit (from marker point pairs at anchor keyframe)")
-            scale_source = "anchor_marker_points"
-            scale_recovered = True
-        except ValueError as exc:
-            scale = 1.0
-            scale_source = "ambiguous_unit_scale"
-            scale_recovered = False
-            scale_warning = (
-                f"{name}: scale could not be recovered from marker SLAM points ({exc}); "
-                "using unit SLAM scale, so translations involving this camera are scale-ambiguous."
-            )
-            print(scale_warning)
-    else:
-        scale = 1.0
-        scale_source = "visual_marker_unit_scale"
-        scale_recovered = False
-        scale_warning = (
-            f"{name}: scale could not be recovered because only "
-            f"{anchor['num_marker_points']} SLAM marker point(s) were available; "
-            "using visual ArUco corners for the anchor and unit SLAM scale. "
-            "Translations involving this camera are scale-ambiguous."
-        )
-        print(scale_warning)
-
-    anchor_timestamp, camera_center_slam_anchor, R_slam_anchor = trajectory[kf_id]
-
-    # p_cam = R_marker @ p_marker + t_marker  and  p_cam = R_slam_anchor @ p_slam + t_slam_anchor
-    # (both world-to-camera rotations for the same physical camera pose at kf_id)
-    R_slam_to_marker = R_marker.T @ R_slam_anchor
-    camera_center_marker = -R_marker.T @ t_marker
-    t_slam_to_marker = camera_center_marker - scale * (R_slam_to_marker @ camera_center_slam_anchor)
-
-    items = sorted(trajectory.items(), key=lambda kv: kv[1][0])
-    kf_ids_sorted = np.array([k for k, _ in items], dtype=np.int64)
-    timestamps = np.array([v[0] for _, v in items], dtype=np.float64)
-    centers_slam = np.array([v[1] for _, v in items], dtype=np.float64)
-    rotations_slam = np.array([v[2] for _, v in items], dtype=np.float64)
-
-    positions_marker = scale * (centers_slam @ R_slam_to_marker.T) + t_slam_to_marker
-    # Rcw_marker[n] = Rcw_slam[n] @ R_slam_to_marker.T (verified against the anchor: at
-    # kf_id this reduces exactly back to R_marker).
-    rotations_marker = rotations_slam @ R_slam_to_marker.T
-    anchor_check = scale * (R_slam_to_marker @ camera_center_slam_anchor) + t_slam_to_marker
-
-    return {
-        "name": name,
-        "marker_id": marker_id,
-        "kf_id": kf_id,
-        "scale": scale,
-        "scale_source": scale_source,
-        "scale_recovered": scale_recovered,
-        "scale_warning": scale_warning,
-        "R_slam_to_marker": R_slam_to_marker,
-        "t_slam_to_marker": t_slam_to_marker,
-        "trajectory_kf_ids": kf_ids_sorted,
-        "trajectory_timestamps": timestamps,
-        "trajectory_timestamp_source": timestamp_source,
-        "trajectory": positions_marker,
-        "trajectory_rotations": rotations_marker,
-        "anchor_point": anchor_check,
-        "anchor_timestamp": anchor_timestamp,
-        "num_marker_points": int(anchor["num_marker_points"]),
-        "num_visual_corners": int(anchor["num_visual_corners"]),
-        "marker_pnp_input": anchor["marker_pnp_input"],
-        "visual_marker_keyframes": anchor["visual_marker_keyframes"],
-        "visual_marker_detections": anchor["visual_marker_detections"],
-        "anchor_image_path": anchor["image_path"],
-        "marker_pnp_rms_px": err_marker_px,
-    }
-
-
 def collect_visual_aruco_pose_observations(
     name: str,
     raw_csv_path: Path,
@@ -942,6 +680,7 @@ def collect_visual_aruco_pose_observations(
     calib: CameraCalibration,
     marker_length_m: float,
     dictionary_size: int,
+    dictionary_bits: int,
     trajectory: Dict[int, Tuple[float, np.ndarray, np.ndarray]],
     max_rms_px: float,
     max_keyframes: Optional[int],
@@ -969,7 +708,7 @@ def collect_visual_aruco_pose_observations(
         if image is None:
             missing_images += 1
             continue
-        corners_list, ids = detect_markers(image, dictionary_size)
+        corners_list, ids = detect_markers(image, dictionary_size, dictionary_bits)
         if ids is None:
             continue
 
@@ -1277,6 +1016,7 @@ def align_camera_visual_aruco_sim3(
     calib: CameraCalibration,
     marker_length_m: float,
     dictionary_size: int,
+    dictionary_bits: int,
     min_detections: int,
     max_rms_px: float,
     max_keyframes: Optional[int],
@@ -1292,6 +1032,7 @@ def align_camera_visual_aruco_sim3(
         calib,
         marker_length_m,
         dictionary_size,
+        dictionary_bits,
         trajectory,
         max_rms_px,
         max_keyframes,
@@ -1346,6 +1087,185 @@ def align_camera_visual_aruco_sim3(
     }
 
 
+def fit_visual_aruco_sim3_fixed_scale(
+    name: str,
+    observations: List[Dict[str, object]],
+    min_detections: int,
+    trim_mad: float,
+    fixed_scale: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, object]]:
+    """Same robust multi-keyframe rotation fit as fit_visual_aruco_sim3 (chordal-mean
+    rotation average with MAD-trimmed outlier rejection), but the scale is held fixed
+    at an externally-supplied value throughout every iteration instead of being fit
+    jointly. Outlier trimming and the final translation are therefore self-consistent
+    with the scale that will actually be used, rather than mixing an outlier set
+    chosen under Sim3's own independently-fit scale with a different external one."""
+    if len(observations) < min_detections:
+        raise ValueError(
+            f"{name}: only {len(observations)} visual ArUco detection(s), need {min_detections} "
+            "for a fixed-scale visual ArUco Sim(3) rotation fit"
+        )
+
+    centers_slam = np.array([obs["center_slam"] for obs in observations], dtype=np.float64)
+    centers_marker = np.array([obs["center_marker"] for obs in observations], dtype=np.float64)
+    rotations = np.array([obs["R_slam_to_marker"] for obs in observations], dtype=np.float64)
+    keep = np.ones(len(observations), dtype=bool)
+
+    R_slam_to_marker = np.eye(3, dtype=np.float64)
+    t_slam_to_marker = np.zeros(3, dtype=np.float64)
+    residuals = np.zeros(len(observations), dtype=np.float64)
+
+    for _ in range(5):
+        if int(np.count_nonzero(keep)) < min_detections:
+            break
+        R_slam_to_marker = rotation_chordal_mean(rotations[keep])
+        slam_rotated = centers_slam[keep] @ R_slam_to_marker.T
+        marker_kept = centers_marker[keep]
+        t_candidates = marker_kept - fixed_scale * slam_rotated
+        t_slam_to_marker = np.median(t_candidates, axis=0)
+        predicted_all = fixed_scale * (centers_slam @ R_slam_to_marker.T) + t_slam_to_marker
+        residuals = np.linalg.norm(predicted_all - centers_marker, axis=1)
+
+        if trim_mad <= 0.0:
+            break
+        kept_residuals = residuals[keep]
+        median = float(np.median(kept_residuals))
+        mad = float(np.median(np.abs(kept_residuals - median)))
+        if mad <= 1e-12:
+            break
+        threshold = median + trim_mad * 1.4826 * mad
+        new_keep = residuals <= threshold
+        if int(np.count_nonzero(new_keep)) < min_detections or np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+
+    kept_residuals = residuals[keep]
+    rotation_devs = np.array([rotation_angle_deg(R, R_slam_to_marker) for R in rotations], dtype=np.float64)
+    diagnostics = {
+        "visual_detections_total": int(len(observations)),
+        "visual_detections_used": int(np.count_nonzero(keep)),
+        "visual_detections_rejected": int(len(observations) - np.count_nonzero(keep)),
+        "fixed_scale_m_per_slam_unit": float(fixed_scale),
+        "visual_sim3_residual_m": {
+            "median_all": float(np.median(residuals)),
+            "mean_all": float(np.mean(residuals)),
+            "max_all": float(np.max(residuals)),
+            "median_used": float(np.median(kept_residuals)),
+            "mean_used": float(np.mean(kept_residuals)),
+            "max_used": float(np.max(kept_residuals)),
+        },
+        "visual_rotation_deviation_deg": {
+            "median": float(np.median(rotation_devs)),
+            "mean": float(np.mean(rotation_devs)),
+            "max": float(np.max(rotation_devs)),
+        },
+    }
+    print(
+        f"{name}: visual ArUco Sim(3) with fixed scale = {fixed_scale:.6f} m/slam-unit "
+        f"using {diagnostics['visual_detections_used']}/{diagnostics['visual_detections_total']} detection(s); "
+        f"residual median={diagnostics['visual_sim3_residual_m']['median_used']:.4f} m, "
+        f"rotation dev median={diagnostics['visual_rotation_deviation_deg']['median']:.3f} deg"
+    )
+    return R_slam_to_marker, t_slam_to_marker, keep, diagnostics
+
+
+def align_camera_optimized_anchor(
+    name: str,
+    marker_id: int,
+    raw_csv_path: Path,
+    calib: CameraCalibration,
+    marker_length_m: float,
+    dictionary_size: int,
+    dictionary_bits: int,
+    min_detections: int,
+    max_rms_px: float,
+    max_keyframes: Optional[int],
+    trim_mad: float,
+    forced_scale: float,
+    use_source_timestamps: bool = True,
+) -> Dict[str, object]:
+    """Same robust, many-keyframe rotation fit as align_camera_visual_aruco_sim3
+    (marker detected across many keyframes, combined via a MAD-trimmed chordal-mean
+    rotation average instead of one single anchor keyframe's PnP solve), but the
+    metric scale is taken from `forced_scale` (e.g. ground-plane or point-pair scale
+    recovery) instead of being fit jointly with rotation. This isolates the
+    single-anchor-keyframe robustness fix from the choice of scale source: any scale
+    recovery approach can be paired with this more robust rotation estimate."""
+    trajectory, timestamp_source = load_trajectory(raw_csv_path, name, use_source_timestamps)
+    print(f"{name}: trajectory timestamps = {timestamp_source}")
+    observations = collect_visual_aruco_pose_observations(
+        name,
+        raw_csv_path,
+        marker_id,
+        calib,
+        marker_length_m,
+        dictionary_size,
+        dictionary_bits,
+        trajectory,
+        max_rms_px,
+        max_keyframes,
+    )
+    # Same robust multi-keyframe rotation fit as visual-aruco-sim3, but with the
+    # scale held fixed at forced_scale throughout -- so outlier trimming and the
+    # final translation are consistent with the scale we're actually using, not
+    # with whatever scale Sim(3) would have fit on its own.
+    R_slam_to_marker, t_slam_to_marker, keep, diagnostics = fit_visual_aruco_sim3_fixed_scale(
+        name,
+        observations,
+        min_detections,
+        trim_mad,
+        forced_scale,
+    )
+
+    best_index = min(
+        range(len(observations)),
+        key=lambda idx: (float(observations[idx]["rms_px"]), -float(observations[idx]["area_px2"])),
+    )
+    anchor_obs = observations[best_index]
+    kf_id = int(anchor_obs["kf_id"])
+    anchor_timestamp = float(anchor_obs["timestamp"])
+
+    items = sorted(trajectory.items(), key=lambda kv: kv[1][0])
+    kf_ids_sorted = np.array([k for k, _ in items], dtype=np.int64)
+    timestamps = np.array([v[0] for _, v in items], dtype=np.float64)
+    centers_slam = np.array([v[1] for _, v in items], dtype=np.float64)
+    rotations_slam = np.array([v[2] for _, v in items], dtype=np.float64)
+
+    positions_marker = forced_scale * (centers_slam @ R_slam_to_marker.T) + t_slam_to_marker
+    rotations_marker = rotations_slam @ R_slam_to_marker.T
+    anchor_point = (
+        forced_scale * (np.asarray(anchor_obs["center_slam"], dtype=np.float64) @ R_slam_to_marker.T)
+        + t_slam_to_marker
+    )
+
+    return {
+        "name": name,
+        "marker_id": marker_id,
+        "kf_id": kf_id,
+        "scale": forced_scale,
+        "scale_source": "external_optimized_anchor",
+        "scale_recovered": True,
+        "scale_warning": None,
+        "R_slam_to_marker": R_slam_to_marker,
+        "t_slam_to_marker": t_slam_to_marker,
+        "trajectory_kf_ids": kf_ids_sorted,
+        "trajectory_timestamps": timestamps,
+        "trajectory_timestamp_source": timestamp_source,
+        "trajectory": positions_marker,
+        "trajectory_rotations": rotations_marker,
+        "anchor_point": anchor_point,
+        "anchor_timestamp": anchor_timestamp,
+        "num_marker_points": 0,
+        "num_visual_corners": 4,
+        "marker_pnp_input": "optimized_anchor",
+        "visual_marker_keyframes": int(len({int(obs["kf_id"]) for obs in observations})),
+        "visual_marker_detections": int(len(observations)),
+        "anchor_image_path": str(anchor_obs["image_path"]),
+        "marker_pnp_rms_px": float(anchor_obs["rms_px"]),
+        "visual_sim3_diagnostics": diagnostics,
+    }
+
+
 def align_camera_visual_aruco_motion_scale(
     name: str,
     marker_id: int,
@@ -1353,6 +1273,7 @@ def align_camera_visual_aruco_motion_scale(
     calib: CameraCalibration,
     marker_length_m: float,
     dictionary_size: int,
+    dictionary_bits: int,
     min_detections: int,
     max_rms_px: float,
     max_keyframes: Optional[int],
@@ -1370,6 +1291,7 @@ def align_camera_visual_aruco_motion_scale(
         calib,
         marker_length_m,
         dictionary_size,
+        dictionary_bits,
         trajectory,
         max_rms_px,
         max_keyframes,
@@ -1564,6 +1486,7 @@ def plot_trajectories(
     max_time_from_anchor_s: Optional[float] = None,
     per_camera_max_time_from_anchor_s: Optional[List[Optional[float]]] = None,
     surviving_match_points: Optional[List[np.ndarray]] = None,
+    show_anchor_marker: bool = True,
 ) -> None:
     import matplotlib
 
@@ -1639,8 +1562,9 @@ def plot_trajectories(
                 linewidth=2.8,
                 label=f"{res['name']} within {cutoff_text}",
             )
-        ax.scatter(anchor[0], anchor[1], anchor[2], color=color, marker="*", s=220, edgecolor="black",
-                    label=f"{res['name']} kf{res['kf_id']} anchor")
+        if show_anchor_marker:
+            ax.scatter(anchor[0], anchor[1], anchor[2], color=color, marker="*", s=220, edgecolor="black",
+                        label=f"{res['name']} kf{res['kf_id']} anchor")
         if distance_cutoff is not None:
             plot_anchor_distance_cutoff(
                 ax,
@@ -1740,16 +1664,17 @@ def plot_trajectories(
             time_cutoff,
             surviving_match_points[i] if surviving_match_points is not None else None,
         )
-        ax2.scatter(
-            anchor[0],
-            anchor[1],
-            color=color,
-            marker="*",
-            s=170,
-            edgecolor="black",
-            label=f"{res['name']} kf{res['kf_id']} anchor",
-            zorder=10,
-        )
+        if show_anchor_marker:
+            ax2.scatter(
+                anchor[0],
+                anchor[1],
+                color=color,
+                marker="*",
+                s=170,
+                edgecolor="black",
+                label=f"{res['name']} kf{res['kf_id']} anchor",
+                zorder=10,
+            )
         if distance_cutoff is not None:
             plot_anchor_distance_cutoff_2d(
                 ax2,
@@ -1828,7 +1753,7 @@ def plot_trajectories(
 
 
 # --------------------------------------------------------------------------------------
-# Stage 2: extrinsic calibration (reuses stage 1's align_camera() results)
+# Stage 2: extrinsic calibration (reuses stage 1's per-camera alignment results)
 # --------------------------------------------------------------------------------------
 
 
@@ -2375,6 +2300,7 @@ def main() -> int:
             calib1,
             args.marker_length_m,
             args.dictionary_size,
+            args.dictionary_bits,
             args.visual_aruco_min_detections,
             args.visual_aruco_max_rms_px,
             args.visual_aruco_max_keyframes,
@@ -2388,6 +2314,7 @@ def main() -> int:
             calib2,
             args.marker_length_m,
             args.dictionary_size,
+            args.dictionary_bits,
             args.visual_aruco_min_detections,
             args.visual_aruco_max_rms_px,
             args.visual_aruco_max_keyframes,
@@ -2402,6 +2329,7 @@ def main() -> int:
             calib1,
             args.marker_length_m,
             args.dictionary_size,
+            args.dictionary_bits,
             args.visual_aruco_min_detections,
             args.visual_aruco_max_rms_px,
             args.visual_aruco_max_keyframes,
@@ -2417,6 +2345,7 @@ def main() -> int:
             calib2,
             args.marker_length_m,
             args.dictionary_size,
+            args.dictionary_bits,
             args.visual_aruco_min_detections,
             args.visual_aruco_max_rms_px,
             args.visual_aruco_max_keyframes,
@@ -2425,46 +2354,44 @@ def main() -> int:
             args.visual_aruco_motion_max_pairs,
             use_source_timestamps,
         )
-    else:
-        anchor1 = select_anchor_observation(
+    elif args.alignment_source == "optimized-anchor":
+        if args.camera1_scale is None or args.camera2_scale is None:
+            raise SystemExit(
+                "--alignment-source optimized-anchor requires both --camera1-scale and --camera2-scale "
+                "(it fits rotation from many keyframes but always takes scale externally)."
+            )
+        result1 = align_camera_optimized_anchor(
             args.camera1_name,
-            rows1,
             marker_id,
             args.camera1_raw_csv,
             calib1,
             args.marker_length_m,
             args.dictionary_size,
-            args.keyframe_candidates,
-        )
-        anchor2 = select_anchor_observation(
-            args.camera2_name,
-            rows2,
-            marker_id,
-            args.camera2_raw_csv,
-            calib2,
-            args.marker_length_m,
-            args.dictionary_size,
-            args.keyframe_candidates,
-        )
-
-        result1 = align_camera(
-            args.camera1_name,
-            marker_id,
-            anchor1,
-            args.camera1_raw_csv,
-            calib1,
+            args.dictionary_bits,
+            args.visual_aruco_min_detections,
+            args.visual_aruco_max_rms_px,
+            args.visual_aruco_max_keyframes,
+            args.visual_aruco_trim_mad,
             args.camera1_scale,
             use_source_timestamps,
         )
-        result2 = align_camera(
+        result2 = align_camera_optimized_anchor(
             args.camera2_name,
             marker_id,
-            anchor2,
             args.camera2_raw_csv,
             calib2,
+            args.marker_length_m,
+            args.dictionary_size,
+            args.dictionary_bits,
+            args.visual_aruco_min_detections,
+            args.visual_aruco_max_rms_px,
+            args.visual_aruco_max_keyframes,
+            args.visual_aruco_trim_mad,
             args.camera2_scale,
             use_source_timestamps,
         )
+    else:
+        raise SystemExit(f"Unknown --alignment-source: {args.alignment_source}")
 
     # --- Stage 2 outputs ---
     extrinsic_yaml, diagnostics, plot_matches = compute_extrinsic(args, marker_id, result1, result2)
@@ -2485,6 +2412,7 @@ def main() -> int:
         if (camera_time_cutoff(args, 1) is not None or camera_time_cutoff(args, 2) is not None)
         else None,
         surviving_match_points=[plot_matches["camera1_positions"], plot_matches["camera2_positions"]],
+        show_anchor_marker=not args.hide_anchor_marker,
     )
 
     alignment_summary = {

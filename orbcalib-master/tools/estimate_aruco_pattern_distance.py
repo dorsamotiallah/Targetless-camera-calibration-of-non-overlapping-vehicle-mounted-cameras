@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect one expected 6x6 ArUco marker and estimate distance to its plane."""
+"""Detect one expected ArUco marker and estimate distance to its plane."""
 
 from __future__ import annotations
 
@@ -18,21 +18,21 @@ from estimate_checkerboard_camera_height import (
 )
 
 
-ARUCO_6X6_DICTIONARIES = {
-    50: cv2.aruco.DICT_6X6_50,
-    100: cv2.aruco.DICT_6X6_100,
-    250: cv2.aruco.DICT_6X6_250,
-    1000: cv2.aruco.DICT_6X6_1000,
-}
+ARUCO_DICTIONARY_SIZES = (50, 100, 250, 1000)
 EXPECTED_IDS = tuple(range(4))
 
 
-def dictionary_name(dictionary_size: int) -> str:
-    return f"6x6_{dictionary_size}"
+def dictionary_name(dictionary_size: int, dictionary_bits: int = 6) -> str:
+    return f"{dictionary_bits}x{dictionary_bits}_{dictionary_size}"
 
 
-def get_aruco_dictionary(dictionary_size: int) -> cv2.aruco.Dictionary:
-    dict_id = ARUCO_6X6_DICTIONARIES[dictionary_size]
+def get_aruco_dictionary(dictionary_size: int, dictionary_bits: int = 6) -> cv2.aruco.Dictionary:
+    if dictionary_size not in ARUCO_DICTIONARY_SIZES:
+        raise ValueError(f"Unsupported ArUco dictionary size: {dictionary_size}")
+    name = f"DICT_{dictionary_bits}X{dictionary_bits}_{dictionary_size}"
+    if not hasattr(cv2.aruco, name):
+        raise ValueError(f"Unsupported ArUco dictionary: {dictionary_name(dictionary_size, dictionary_bits)}")
+    dict_id = getattr(cv2.aruco, name)
     if hasattr(cv2.aruco, "getPredefinedDictionary"):
         return cv2.aruco.getPredefinedDictionary(dict_id)
     return cv2.aruco.Dictionary_get(dict_id)
@@ -47,8 +47,9 @@ def make_detector_parameters() -> cv2.aruco.DetectorParameters:
 def detect_markers(
     image: np.ndarray,
     dictionary_size: int,
+    dictionary_bits: int = 6,
 ) -> Tuple[List[np.ndarray], np.ndarray | None, List[np.ndarray]]:
-    dictionary = get_aruco_dictionary(dictionary_size)
+    dictionary = get_aruco_dictionary(dictionary_size, dictionary_bits)
     parameters = make_detector_parameters()
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
 
@@ -217,15 +218,16 @@ def estimate_aruco_distances(
     marker_length: float,
     expected_id: int,
     dictionary_size: int,
+    dictionary_bits: int = 6,
 ) -> Dict[str, object]:
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise RuntimeError(f"Could not read image: {image_path}")
 
     calib = scaled_calibration(read_calibration(calib_path), (image.shape[1], image.shape[0]))
-    corners, ids, rejected = detect_markers(image, dictionary_size)
+    corners, ids, rejected = detect_markers(image, dictionary_size, dictionary_bits)
     if ids is None or len(ids) == 0:
-        raise RuntimeError(f"No {dictionary_name(dictionary_size)} ArUco markers found in {image_path}")
+        raise RuntimeError(f"No {dictionary_name(dictionary_size, dictionary_bits)} ArUco markers found in {image_path}")
 
     detected_ids = [int(marker_id) for marker_id in ids.reshape(-1)]
     allowed_detected_ids = [marker_id for marker_id in detected_ids if marker_id in EXPECTED_IDS]
@@ -265,7 +267,7 @@ def estimate_aruco_distances(
         "camera_model": calib.model,
         "image_width": int(image.shape[1]),
         "image_height": int(image.shape[0]),
-        "aruco_dictionary": dictionary_name(dictionary_size),
+        "aruco_dictionary": dictionary_name(dictionary_size, dictionary_bits),
         "marker_length": marker_length,
         "expected_id": expected_id,
         "detected_ids": detected_ids,
@@ -283,13 +285,14 @@ def make_debug_image(
     marker_length: float,
     expected_id: int,
     dictionary_size: int,
+    dictionary_bits: int,
     result: Dict[str, object],
 ) -> np.ndarray:
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise RuntimeError(f"Could not read image for debug output: {image_path}")
     calib = scaled_calibration(read_calibration(calib_path), (image.shape[1], image.shape[0]))
-    corners, ids, _ = detect_markers(image, dictionary_size)
+    corners, ids, _ = detect_markers(image, dictionary_size, dictionary_bits)
 
     detected_ids = [] if ids is None else [int(marker_id) for marker_id in ids.reshape(-1)]
     for marker_corners, marker_id in zip(corners, detected_ids):
@@ -322,9 +325,10 @@ def write_debug_image(
     marker_length: float,
     expected_id: int,
     dictionary_size: int,
+    dictionary_bits: int,
     result: Dict[str, object],
 ) -> None:
-    image = make_debug_image(image_path, calib_path, marker_length, expected_id, dictionary_size, result)
+    image = make_debug_image(image_path, calib_path, marker_length, expected_id, dictionary_size, dictionary_bits, result)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(output_path), image):
@@ -337,9 +341,10 @@ def show_debug_image(
     marker_length: float,
     expected_id: int,
     dictionary_size: int,
+    dictionary_bits: int,
     result: Dict[str, object],
 ) -> None:
-    image = make_debug_image(image_path, calib_path, marker_length, expected_id, dictionary_size, result)
+    image = make_debug_image(image_path, calib_path, marker_length, expected_id, dictionary_size, dictionary_bits, result)
     cv2.imshow("ArUco distance debug", image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
@@ -370,9 +375,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dictionary-size",
         type=int,
-        choices=sorted(ARUCO_6X6_DICTIONARIES),
+        choices=ARUCO_DICTIONARY_SIZES,
         default=50,
-        help="OpenCV 6x6 predefined dictionary size. Default is DICT_6X6_50.",
+        help="OpenCV predefined dictionary size. Default is 50.",
+    )
+    parser.add_argument(
+        "--dictionary-bits",
+        type=int,
+        choices=(4, 5, 6, 7),
+        default=6,
+        help="ArUco marker grid size. Default is 6 for DICT_6X6_*.",
     )
     parser.add_argument(
         "--debug-image",
@@ -403,6 +415,7 @@ def main() -> int:
         marker_length=args.marker_length,
         expected_id=args.expected_id,
         dictionary_size=args.dictionary_size,
+        dictionary_bits=args.dictionary_bits,
     )
 
     if args.debug_image is not None:
@@ -413,6 +426,7 @@ def main() -> int:
             args.marker_length,
             args.expected_id,
             args.dictionary_size,
+            args.dictionary_bits,
             result,
         )
     if args.show:
@@ -422,6 +436,7 @@ def main() -> int:
             args.marker_length,
             args.expected_id,
             args.dictionary_size,
+            args.dictionary_bits,
             result,
         )
 

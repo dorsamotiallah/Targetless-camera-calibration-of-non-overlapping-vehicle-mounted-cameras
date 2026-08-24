@@ -1,7 +1,7 @@
 # Runbook: FinnForest + Docker + ROS 1 Replay
 
 This file documents a separate FinnForest workflow for `orbcalib-master`.
-It does not replace or modify [RUN_DOCKER.md](/home/civit/Desktop/Dorsa/orbcalib-master/RUN_DOCKER.md). Keep using `RUN_DOCKER.md` for the existing Gazebo / MCAP setup.
+It does not replace or modify [RUN_DOCKER.md](RUN_DOCKER.md). Keep using `RUN_DOCKER.md` for the existing Gazebo / MCAP setup.
 
 This FinnForest workflow uses:
 
@@ -18,7 +18,7 @@ use the online FinnForest PNG publisher.
 
 For ACK-driven playback that waits for ORB-SLAM to finish processing frames
 before publishing too far ahead, use
-[RUN_DOCKER_FINNFOREST_CONTROLLED.md](/home/civit/Desktop/Dorsa/orbcalib-master/RUN_DOCKER_FINNFOREST_CONTROLLED.md).
+[RUN_DOCKER_FINNFOREST_CONTROLLED.md](RUN_DOCKER_FINNFOREST_CONTROLLED.md).
 
 ## Assumptions
 
