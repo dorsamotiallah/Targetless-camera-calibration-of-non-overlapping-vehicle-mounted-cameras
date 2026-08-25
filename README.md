@@ -53,8 +53,7 @@ Start here:
 - [jiejie567/SlamForCalib](https://github.com/jiejie567/SlamForCalib) --
   official CamMap implementation released by the CamMap authors.
 - [Rick0514/orbcalib](https://github.com/Rick0514/orbcalib) -- cleaner
-  CamMap-based repository referenced by the official implementation; this
-  project was originally forked from it.
+  CamMap-based repository referenced by the official implementation; this project is based on / adapted from it.
 - [UZ-SLAMLab/ORB_SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3) -- SLAM
   system used as the base mapping and tracking framework.
 
